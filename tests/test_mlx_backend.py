@@ -111,3 +111,16 @@ async def test_ring_matches_mlx_lm_generate(tiny_model, tmp_path):
     finally:
         for d in hosts:
             await d.stop()
+
+
+def test_bench_baselines_match_mlx_lm(tiny_model):
+    from slugai.bench import run_single, run_streaming
+    from slugai.mlx_backend import MLXBackend
+
+    ref = mlx_lm_reference(tiny_model, PROMPTS, 6)
+    be = MLXBackend(use_chat_template=False)
+    single, _ = run_single(be, str(tiny_model), PROMPTS, max_tokens=6, batch=4)
+    assert [[t for t in g if t != 2] for g in single] == ref
+    streaming, stats = run_streaming(be, str(tiny_model), PROMPTS[:3], max_tokens=4, batch=3)
+    assert [[t for t in g if t != 2] for g in streaming] == [g[:4] for g in ref[:3]]
+    assert stats["layer_loads"] > 0

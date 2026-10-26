@@ -541,6 +541,9 @@ def _caffeinate() -> Optional[subprocess.Popen]:
 
 
 async def main(args) -> int:
+    from .models import apply_models_dir
+
+    apply_models_dir(args.models_dir)
     backend = get_backend(args.backend)
     name = args.name or socket.gethostname().split(".")[0]
     daemon = HostDaemon(name, args.port, backend, advertise=not args.no_advertise)
