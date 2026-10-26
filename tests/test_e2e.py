@@ -78,6 +78,28 @@ async def test_three_hosts_match_reference(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_right_padding_backend_matches_reference(tmp_path):
+    """The MLX backend right-pads prompts; exercise that path of the host with the fake backend."""
+    hosts = await start_hosts(3, lambda i: FakeBackend(slow_ms=0, free_mem=1 << 30, padding_side="right"))
+    try:
+        addrs = [HostAddr(d.name, "127.0.0.1", d.port) for d in hosts]
+        server = Server(
+            model="fake-L6", prompts=PROMPTS, job="trp", hosts=addrs, min_hosts=3, max_tokens=10,
+            micro_batch=4, num_micro_batches=3, rebalance=False, output_path=str(tmp_path / "o.jsonl"),
+            profile_batch_sizes=(1, 4),
+        )
+        report = await asyncio.wait_for(server.run(), 60)
+        assert report["sequences_done"] == len(PROMPTS)
+        ref = reference_generate(FakeBackend(slow_ms=0), "fake-L6", PROMPTS, 10)
+        tok = FakeBackend().tokenizer("fake-L6")
+        recs = [json.loads(l) for l in (tmp_path / "o.jsonl").read_text().splitlines()]
+        assert [r["completion"] for r in recs] == [tok.decode(g) for g in ref]
+    finally:
+        for d in hosts:
+            await d.stop()
+
+
+@pytest.mark.asyncio
 async def test_single_host_ring(tmp_path):
     hosts = await start_hosts(1, lambda i: FakeBackend(slow_ms=0, free_mem=1 << 30))
     try:

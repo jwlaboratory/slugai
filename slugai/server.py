@@ -497,7 +497,7 @@ class Server:
         ids, toks, texts = f["ids"], f["tokens"], f["texts"]
         ptoks = f.get("prompt_tokens") or [None] * len(ids)
         for i, tk, tx, pt in zip(ids, toks, texts, ptoks):
-            self.outputs[int(i)] = {"id": int(i), "prompt": self.prompts[int(i)], "completion": tx, "tokens": len(tk), "prompt_tokens": pt}
+            self.outputs[int(i)] = {"id": int(i), "prompt": self.prompts[int(i)], "completion": tx, "tokens": len(tk), "prompt_tokens": pt, "token_ids": [int(t) for t in tk]}
             self.state.tokens_generated += len(tk)
         self.state.done_sequences = len(self.outputs)
 

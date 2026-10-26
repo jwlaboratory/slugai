@@ -55,6 +55,7 @@ class SlotState:
     gen: list[list[int]] = field(default_factory=list)
     done: list[bool] = field(default_factory=list)
     started: float = field(default_factory=time.monotonic)
+    prompt_tokens: Optional[list[int]] = None
 
 
 class StatsWindow:
@@ -336,7 +337,13 @@ class HostDaemon:
     # ------------------------------------------------------------------ pipeline
 
     async def _feed(self, f: Frame) -> None:
-        """Server hands stage 1 a micro-batch of prompts for a slot."""
+        """Server hands stage 1 a micro-batch of prompts for a slot.
+
+        Every prompt is split into ``prompt[:-1]`` (one padded prefill frame)
+        and its last token (a decode frame), so after prefill all sequences in
+        the micro-batch are aligned and the first generated token comes out of
+        an ordinary decode step. The padding side is the backend's choice.
+        """
         if self.stage is None or not self.stage.first:
             raise RuntimeError("feed sent to a host that is not stage 1")
         prompts, ids, slot = f["prompts"], f["ids"], int(f["slot"])
@@ -344,14 +351,30 @@ class HostDaemon:
         max_prompt = self.job.get("max_prompt_tokens")
         if max_prompt:
             enc = [e[-int(max_prompt):] for e in enc]
+        enc = [e if e else [self.info.pad_token_id] for e in enc]
+        side = getattr(self.backend, "padding_side", "left")
+        base = {"slot": slot, "ids": list(ids), "prompt_tokens": [len(e) for e in enc]}
         T = max(len(e) for e in enc)
-        arr = np.full((len(enc), T), self.info.pad_token_id, dtype=np.int32)
-        pad_lens = []
-        for i, e in enumerate(enc):
-            arr[i, T - len(e):] = e
-            pad_lens.append(T - len(e))
-        meta = {"slot": slot, "phase": "prefill", "pad_lens": pad_lens, "ids": list(ids), "prompt_tokens": [len(e) for e in enc]}
-        await self.queue.put(Work(slot, "prefill", arr, pad_lens, meta))
+        if T > 1:
+            body = [e[:-1] for e in enc]
+            Tb = T - 1
+            arr = np.full((len(body), Tb), self.info.pad_token_id, dtype=np.int32)
+            pad_lens = []
+            for i, e in enumerate(body):
+                if side == "left":
+                    arr[i, Tb - len(e):] = e
+                else:
+                    arr[i, : len(e)] = e
+                pad_lens.append(Tb - len(e))
+            meta = dict(base, phase="prefill", pad_lens=pad_lens, emit=False)
+            await self.queue.put(Work(slot, "prefill", arr, pad_lens, meta))
+            last = np.array([[e[-1]] for e in enc], dtype=np.int32)
+            await self.queue.put(Work(slot, "decode", last, None, {"slot": slot, "phase": "decode", "emit": True}))
+        else:
+            arr = np.array([[e[-1]] for e in enc], dtype=np.int32)
+            pad_lens = [0] * len(enc)
+            meta = dict(base, phase="prefill", pad_lens=pad_lens, emit=True)
+            await self.queue.put(Work(slot, "prefill", arr, pad_lens, meta))
 
     async def _worker(self) -> None:
         loop = asyncio.get_running_loop()
@@ -396,6 +419,9 @@ class HostDaemon:
         if w.phase == "prefill":
             ids = list(w.meta.get("ids", range(len(tokens))))
             self.slot_state[slot] = SlotState(ids=ids, gen=[[] for _ in ids], done=[False] * len(ids))
+            self.slot_state[slot].prompt_tokens = w.meta.get("prompt_tokens")
+        if not w.meta.get("emit", True):
+            return  # prefill of prompt[:-1]; the decode frame for the last token follows
         st = self.slot_state.get(slot)
         if st is None:
             log.warning("tokens for unknown slot %d", slot)
@@ -413,7 +439,7 @@ class HostDaemon:
             texts = [self.tok.decode(g) for g in st.gen]
             if self.server_conn is not None:
                 await self.server_conn.send(
-                    pack("outputs", slot=slot, ids=st.ids, tokens=st.gen, texts=texts, prompt_tokens=w.meta.get("prompt_tokens"), seconds=time.monotonic() - st.started)
+                    pack("outputs", slot=slot, ids=st.ids, tokens=st.gen, texts=texts, prompt_tokens=st.prompt_tokens, seconds=time.monotonic() - st.started)
                 )
             del self.slot_state[slot]
             await self._deliver_to_first(pack("tokens", slot=slot, done=True))

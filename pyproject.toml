@@ -18,6 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 mlx = ["mlx>=0.22", "mlx-lm>=0.22"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# MLX backend tests on Linux CI use the CPU build: pip install "mlx[cpu]" mlx-lm transformers
+
 
 [project.scripts]
 slugai = "slugai.cli:main"

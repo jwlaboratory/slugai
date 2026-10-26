@@ -103,6 +103,7 @@ class Stage(abc.ABC):
 
 class Backend(abc.ABC):
     name: str = "base"
+    padding_side: str = "left"  # how stage 1 pads prompts inside a micro-batch
 
     @abc.abstractmethod
     def model_info(self, model_id: str) -> ModelInfo: ...
@@ -215,11 +216,12 @@ class FakeStage(Stage):
     run and a pipelined run (which ships fp16 over the wire) are bit-identical.
     """
 
-    def __init__(self, params: dict, layer_range: tuple[int, int], first: bool, last: bool, slow_ms: float = 0.0):
+    def __init__(self, params: dict, layer_range: tuple[int, int], first: bool, last: bool, slow_ms: float = 0.0, padding_side: str = "left"):
         self.p = params
         self.layer_range = layer_range
         self.first, self.last = first, last
         self.slow_ms = slow_ms
+        self.padding_side = padding_side
         self.caches: dict[int, dict] = {}
         self.D = params["embed"].shape[1]
 
@@ -272,7 +274,7 @@ class FakeStage(Stage):
         if phase == "prefill":
             if pad_lens is None:
                 raise ValueError("prefill needs pad_lens")
-            self.caches[slot] = {"kv": [None] * (bnd - a), "pad": np.asarray(pad_lens, dtype=np.int64), "len": 0}
+            self.caches[slot] = {"kv": [None] * (bnd - a), "pad": np.asarray(pad_lens, dtype=np.int64), "len": 0, "prefill_len": x.shape[1]}
         elif slot not in self.caches:
             raise RuntimeError(f"slot {slot} has no cache; prefill first")
         c = self.caches[slot]
@@ -283,7 +285,12 @@ class FakeStage(Stage):
         b, T, _ = h.shape
         c["len"] += T
         Tk = c["len"]
-        valid = np.arange(Tk)[None, :] >= c["pad"][:, None]  # (b, Tk)
+        pos = np.arange(Tk)[None, :]
+        if self.padding_side == "left":
+            valid = pos >= c["pad"][:, None]  # (b, Tk)
+        else:  # right padding: pads sit between the prompt and the generated tokens
+            Tp = c["prefill_len"]
+            valid = (pos < (Tp - c["pad"])[:, None]) | (pos >= Tp)
         for li in range(a, bnd):
             W = self.p["layers"][li]
             h = h + self._attn(slot, li, _rms(h), valid)
@@ -302,8 +309,9 @@ class FakeStage(Stage):
 class FakeBackend(Backend):
     name = "fake"
 
-    def __init__(self, slow_ms: Optional[float] = None, free_mem: Optional[int] = None):
+    def __init__(self, slow_ms: Optional[float] = None, free_mem: Optional[int] = None, padding_side: str = "left"):
         self.slow_ms = float(os.environ.get("SLUGAI_FAKE_SLOW_MS", "0")) if slow_ms is None else slow_ms
+        self.padding_side = padding_side
         self._free_mem = (
             int(float(os.environ.get("SLUGAI_FAKE_MEM_GB", "16")) * (1 << 30)) if free_mem is None else free_mem
         )
@@ -350,7 +358,7 @@ class FakeBackend(Backend):
         return self._tok
 
     def load_stage(self, model_id: str, layer_range: tuple[int, int], first: bool, last: bool) -> Stage:
-        return FakeStage(self._params_for(model_id), layer_range, first, last, slow_ms=self.slow_ms)
+        return FakeStage(self._params_for(model_id), layer_range, first, last, slow_ms=self.slow_ms, padding_side=self.padding_side)
 
     def free_memory(self) -> int:
         return self._free_mem
