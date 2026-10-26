@@ -40,6 +40,7 @@ class Frame:
     type: str
     body: dict[str, Any] = field(default_factory=dict)
     tensor: Optional[np.ndarray] = None
+    wire_bytes: int = field(default=0, compare=False)  # set by the reader, informational
 
     def __getitem__(self, key: str) -> Any:
         return self.body[key]
@@ -119,7 +120,9 @@ async def read_frame(reader) -> Optional[Frame]:
         data = await reader.readexactly(total)
     except Exception:
         return None
-    return Frame.decode(data)
+    f = Frame.decode(data)
+    f.wire_bytes = 4 + total
+    return f
 
 
 async def write_frame(writer, frame: Frame) -> int:

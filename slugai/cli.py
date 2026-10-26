@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--models-dir", default=None, help="where prep-model staged model files (default ~/.slugai/models)")
     h.add_argument("--backend", default="auto", choices=["auto", "mlx", "fake"], help="fake = numpy toy model for tests")
     h.add_argument("--no-caffeinate", action="store_true", help="do not block sleep")
+    h.add_argument("--no-advertise", action="store_true", help="do not advertise over Bonjour")
 
     r = sub.add_parser("run", help="start a job (server side)")
     r.add_argument("--model", required=True, help="model id, e.g. mlx-community/Qwen3-8B-4bit")
@@ -46,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--num-micro-batches", type=int, default=None, help="force number of micro-batches in flight")
     r.add_argument("--no-tui", action="store_true", help="plain log lines instead of the dashboard")
     r.add_argument("--report", default=None, help="write a JSON report here when done")
+    r.add_argument("--output", default=None, help="write completions here (.jsonl); default <job>.jsonl")
+    r.add_argument("--rebalance-every", type=float, default=20.0, help="seconds between rebalance checks")
     r.add_argument("--no-rebalance", action="store_true")
     r.add_argument("--limit", type=int, default=None, help="only run the first N prompts")
 
@@ -56,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--max-tokens", type=int, default=256)
     b.add_argument("--batch", type=int, default=64)
     b.add_argument("--limit", type=int, default=None)
+    b.add_argument("--backend", default="auto", choices=["auto", "mlx", "fake"])
     b.add_argument("--report", default=None)
 
     pm = sub.add_parser("prep-model", help="download and stage model files on this Mac")
