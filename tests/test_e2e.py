@@ -199,3 +199,22 @@ async def test_dashboard_render_and_discovery(tmp_path):
     if not found:
         pytest.skip("no multicast in this environment")
     assert any(h.name == "zc-test-host" and h.port == 12345 for h in found)
+
+
+@pytest.mark.asyncio
+async def test_textual_dashboard_headless(tmp_path):
+    from slugai.dashboard import run_tui
+
+    hosts = await start_hosts(2, lambda i: FakeBackend(slow_ms=0, free_mem=1 << 30))
+    try:
+        addrs = [HostAddr(d.name, "127.0.0.1", d.port) for d in hosts]
+        server = Server(
+            model="fake-L4", prompts=PROMPTS[:4], job="ttui", hosts=addrs, min_hosts=2, max_tokens=4,
+            micro_batch=2, num_micro_batches=2, rebalance=False, output_path=str(tmp_path / "o.jsonl"),
+            profile_batch_sizes=(1, 2),
+        )
+        rc = await asyncio.wait_for(run_tui(server, headless=True), 60)
+        assert rc == 0 and server.state.finished and server.state.done_sequences == 4
+    finally:
+        for d in hosts:
+            await d.stop()

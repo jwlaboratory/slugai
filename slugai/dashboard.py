@@ -121,7 +121,7 @@ async def run_plain(server: "Server", interval: float = 5.0) -> int:
     return 1 if server.state.error else 0
 
 
-async def run_tui(server: "Server") -> int:
+async def run_tui(server: "Server", headless: bool = False) -> int:
     try:
         from textual.app import App, ComposeResult
         from textual.widgets import Static
@@ -142,8 +142,9 @@ async def run_tui(server: "Server") -> int:
 
         def refresh_screen(self) -> None:
             self.query_one("#screen", Static).update(render(server))
-            if server.state.finished and self.job_task.done():
-                self.set_timer(2.0, self.exit)
+            if server.state.finished and self.job_task.done() and not getattr(self, "_exiting", False):
+                self._exiting = True
+                self.set_timer(0.2 if headless else 2.0, self.exit)
 
         async def action_pause(self) -> None:
             if server.state.paused:
@@ -170,7 +171,7 @@ async def run_tui(server: "Server") -> int:
             self.exit()
 
     app = Dashboard()
-    await app.run_async()
+    await app.run_async(headless=headless)
     # print the final screen so it stays in the terminal scrollback
     print(render(server))
     return 1 if server.state.error else 0
