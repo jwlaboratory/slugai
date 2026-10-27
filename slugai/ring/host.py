@@ -3,8 +3,8 @@
 It profiles itself, loads its layers, runs its pipeline stage and streams
 stats. Two kinds of connection arrive on its port:
 
-* **control** (first frame ``hello``) from the server: profile, probe_link,
-  load, start, feed, unload, bye;
+* **control** (first frame ``hello``) from the server: tokenize, profile,
+  probe_link, load, start, feed, unload, bye;
 * **data** (first frame ``peer_hello``) from the previous stage in the ring
   (``hidden`` frames), from the last stage (``tokens`` frames to stage 1), or a
   link probe.
@@ -202,7 +202,9 @@ class HostDaemon:
     async def _handle_control(self, conn: Connection, f: Frame) -> bool:
         """Returns True when the connection should end."""
         t = f.type
-        if t == "profile":
+        if t == "tokenize":
+            await conn.send(await self._tokenize(f))
+        elif t == "profile":
             await conn.send(await self._profile(f))
         elif t == "probe_link":
             await conn.send(await self._probe_link(f))
@@ -224,28 +226,28 @@ class HostDaemon:
             await conn.send(pack("error", request=t, message=f"unknown control message {t}"))
         return False
 
+    async def _tokenize(self, f: Frame) -> Frame:
+        """Prompt lengths in tokens (chat template included), for the server's context sizes."""
+        model, prompts = f["model"], f["prompts"]
+        tok = self.backend.tokenizer(model)
+        lengths = await asyncio.get_running_loop().run_in_executor(self.executor, lambda: [len(tok.encode(p)) for p in prompts])
+        return pack("tokenized", lengths=lengths)
+
     async def _profile(self, f: Frame) -> Frame:
         model = f["model"]
         loop = asyncio.get_running_loop()
-        kw = dict(
-            batch_sizes=tuple(f.get("batch_sizes", (1, 8, 32, 64))),
-            probe_layers=int(f.get("probe_layers", 2)),
-            context=int(f.get("context", 64)),
-        )
+        kw = dict(probe_layers=int(f.get("probe_layers", 2)), context=int(f.get("context", 64)))
+        if f.get("batch_sizes"):
+            kw["batch_sizes"] = tuple(f["batch_sizes"])
         log.info("profiling %s %s", model, kw)
         prof = await loop.run_in_executor(self.executor, lambda: self.backend.profile(model, **kw))
         info = self.backend.model_info(model)
-        lengths = None
-        if f.get("prompts") is not None:
-            tok = self.backend.tokenizer(model)
-            lengths = [len(tok.encode(p)) for p in f["prompts"]]
         return pack(
             "profile_result",
             layer_time={str(k): v for k, v in prof["layer_time"].items()},
             free_mem=prof["free_mem"],
             total_mem=self.backend.total_memory(),
             spec=info.spec.__dict__,
-            prompt_lengths=lengths,
         )
 
     async def _probe_link(self, f: Frame) -> Frame:

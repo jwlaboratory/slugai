@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -54,7 +55,6 @@ class HostClient:
         self.name = addr.name
         self.profile: Optional[HostProfile] = None
         self.spec: Optional[ModelSpec] = None
-        self.prompt_lengths: Optional[list[int]] = None
         self.stats: dict = {}
         self._waiters: dict[str, asyncio.Future] = {}
         self._on_event = on_event
@@ -107,6 +107,7 @@ class HostClient:
 
 def _expected_for(request: str) -> str:
     return {
+        "tokenize": "tokenized",
         "profile": "profile_result",
         "probe_link": "probe_result",
         "load": "loaded",
@@ -174,7 +175,7 @@ class Server:
         rebalance_every: float = 20.0,
         output_path: Optional[str] = None,
         report_path: Optional[str] = None,
-        profile_batch_sizes: tuple[int, ...] = (1, 8, 32, 64),
+        profile_batch_sizes: Optional[tuple[int, ...]] = None,  # None: the hosts' default
     ):
         self.model = model
         self.prompts = prompts
@@ -267,11 +268,19 @@ class Server:
     async def _profile(self) -> None:
         self._set_phase("profile")
         names = list(self.hosts)
-        sample = self.prompts if len(self.prompts) <= 20000 else self.prompts[:20000]
+        # Prompt lengths first: they set the context budget, and hosts profile at the
+        # job's typical cache length (attention over a longer cache costs more).
+        res = await self.hosts[names[0]].request(pack("tokenize", model=self.model, prompts=self.prompts[:20000]), "tokenized", timeout=1800)
+        lengths = list(res["lengths"])
+        self.context = max(lengths) + self.max_tokens
+        profile_context = round(statistics.fmean(lengths)) + self.max_tokens // 2
+        self.report["profile_context"] = profile_context
+        self.state.log(f"profiling at {profile_context} tokens of context (mean prompt {statistics.fmean(lengths):.0f} + half of {self.max_tokens} new tokens)")
+        batch_sizes = {"batch_sizes": list(self.profile_batch_sizes)} if self.profile_batch_sizes else {}
 
-        async def prof(i: int, h: HostClient) -> None:
+        async def prof(h: HostClient) -> None:
             res = await h.request(
-                pack("profile", model=self.model, batch_sizes=list(self.profile_batch_sizes), probe_layers=2, context=64, prompts=sample if i == 0 else None),
+                pack("profile", model=self.model, probe_layers=2, context=profile_context, **batch_sizes),
                 "profile_result",
                 timeout=1800,
             )
@@ -281,16 +290,12 @@ class Server:
                 layer_time={int(k): float(v) for k, v in res["layer_time"].items()},
             )
             h.spec = ModelSpec(**res["spec"])
-            if res.get("prompt_lengths") is not None:
-                h.prompt_lengths = list(res["prompt_lengths"])
             self.state.hosts[h.name]["mem_total"] = res.get("total_mem", self.state.hosts[h.name]["mem_total"])
             lt = ", ".join(f"b{k}={v * 1e3:.1f}ms" for k, v in sorted(h.profile.layer_time.items()))
             self.state.log(f"{h.name}: {h.profile.free_mem / 1e9:.1f} GB free, per layer {lt}")
 
-        await asyncio.gather(*[prof(i, self.hosts[n]) for i, n in enumerate(names)])
+        await asyncio.gather(*[prof(self.hosts[n]) for n in names])
         self.spec = self.hosts[names[0]].spec
-        lengths = self.hosts[names[0]].prompt_lengths or [max(8, len(p) // 3) for p in self.prompts]
-        self.context = max(lengths) + self.max_tokens
         self.state.log(f"model {self.model}: {self.spec.num_layers} layers, hidden {self.spec.hidden_size}, context budget {self.context}")
 
         # links, one at a time so probes don't disturb each other

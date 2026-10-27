@@ -13,7 +13,7 @@ ints), and the payload holds the array's C-contiguous bytes.
 Message types (``type`` field):
 
 control (server <-> host)
-    hello/welcome, profile/profile_result, probe_link/probe_result,
+    hello/welcome, tokenize/tokenized, profile/profile_result, probe_link/probe_result,
     load/loaded, start/started, feed, outputs, slot_free, stats,
     unload/unloaded, heartbeat, error, bye
 data (host <-> host, around the ring)

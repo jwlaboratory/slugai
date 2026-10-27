@@ -67,6 +67,9 @@ async def test_single_host_ring(tiny, tmp_path):
         )
         report = await asyncio.wait_for(server.run(), 60)
         assert report["sequences_done"] == 5
+        # hosts profile at the job's typical cache length: mean prompt + half the new tokens
+        lengths = [len(Backend(use_chat_template=False).tokenizer(str(tiny)).encode(p)) for p in PROMPTS[:5]]
+        assert report["profile_context"] == round(sum(lengths) / len(lengths)) + 6 // 2
         ref = one_machine(tiny, PROMPTS[:5], 6, batch=2)
         assert [r["token_ids"] for r in records(tmp_path / "o.jsonl")] == ref
     finally:

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import statistics
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,6 +117,26 @@ def _cache_sizes(model, block: int) -> tuple[int, int]:
     one, two = _cache_bytes(model, 1), _cache_bytes(model, block + 1)
     per_token = (two - one) / block
     return int(per_token / n + 0.5), max(0, int((one - per_token * block) / n + 0.5))
+
+
+PROFILE_BATCH_SIZES = (1, 8, 16, 32, 64, 128)
+PROFILE_MAX_CONTEXT = 1024  # longer caches cost more to fill than they teach
+
+
+def _non_decreasing(values: list[float]) -> list[float]:
+    """The closest non-decreasing sequence (pool adjacent violators).
+
+    A layer can't get faster per step as the batch grows; a profile that
+    says so is noise, and this averages it away.
+    """
+    blocks: list[list[float]] = []  # [mean, count]
+    for v in values:
+        blocks.append([v, 1])
+        while len(blocks) > 1 and blocks[-2][0] > blocks[-1][0]:
+            m, n = blocks.pop()
+            pm, pn = blocks[-1]
+            blocks[-1] = [(pm * pn + m * n) / (pn + n), pn + n]
+    return [m for m, n in blocks for _ in range(int(n))]
 
 
 def _set_layers(inner, layers: list) -> None:
@@ -369,44 +390,74 @@ class Backend:
 
     # -------------------------------------------------------------- profile
 
-    def profile(self, model_id: str, batch_sizes: Sequence[int] = (1, 8, 32, 64), probe_layers: int = 2, context: int = 64) -> dict:
+    def profile(self, model_id: str, batch_sizes: Sequence[int] = PROFILE_BATCH_SIZES, probe_layers: int = 2, context: int = 64, reps: int = 8) -> dict:
         """Seconds per layer per decode step for each micro-batch size, and free memory.
 
-        Marginal time per layer: time(n2 layers) - time(n1 layers) over
-        (n2 - n1). Loading a stage and embedding tokens has fixed costs;
-        measuring two depths and taking the difference leaves only the
-        per-layer cost. Returns ``{"layer_time": {b: seconds}, "free_mem": bytes}``.
+        Each number is a layer's marginal cost: the step time through n2
+        layers minus n1 layers, over (n2 - n1), so fixed costs (embedding,
+        copies) cancel. Steps run with ``context`` tokens already cached, the
+        job's typical length, because attention over a longer cache costs
+        more; inputs are random tokens so MoE layers route to a realistic mix
+        of experts. After a GPU warm-up, each measurement drops two steps and
+        takes the median of ``reps``, and the results are smoothed so time per
+        layer never falls as the batch grows. Returns
+        ``{"layer_time": {b: seconds}, "free_mem": bytes}``.
         """
         info = self.model_info(model_id)
+        cfg = self.config(model_id)
+        vocab = int(cfg.get("text_config", cfg).get("vocab_size") or 1000)
         L = info.spec.num_layers
         n1 = max(1, min(probe_layers, L))
         n2 = min(L, max(n1 + 2, 2 * n1 + 2))
         depths = (n2, n1) if n2 > n1 else (n2,)  # a model this shallow: whole-stage time per layer
+        context = max(1, min(context, PROFILE_MAX_CONTEXT))
+        rng = np.random.default_rng(0)
         stage = self.load_stage(model_id, (0, n2), first=True, last=False)
         full_layers = list(stage.inner.layers)
+
+        def tokens(b: int, t: int) -> np.ndarray:
+            return rng.integers(0, vocab, (b, t), dtype=np.int32)
+
+        def per_layer(b: int) -> float:
+            """Seconds per layer per decode step of ``b`` sequences.
+
+            Steps through n2 and n1 layers alternate (one cache each), and the
+            median of the paired differences is taken, so clock drift hits
+            both sides alike and cancels.
+            """
+            chunk = max(1, min(context, 8192 // b))  # fill caches in chunks: no huge attention buffers
+            for slot, n in enumerate(depths):
+                _set_layers(stage.inner, full_layers[:n])
+                stage.run(slot, "prefill", tokens(b, chunk), pad_lens=[0] * b)
+                for done in range(chunk, context, chunk):
+                    stage.run(slot, "decode", tokens(b, min(chunk, context - done)))
+            steps = []
+            for _ in range(reps + 2):
+                t = []
+                for slot, n in enumerate(depths):
+                    _set_layers(stage.inner, full_layers[:n])
+                    x = tokens(b, 1)
+                    t0 = time.perf_counter()
+                    stage.run(slot, "decode", x)
+                    t.append(time.perf_counter() - t0)
+                steps.append(t)
+            for slot in range(len(depths)):
+                stage.reset_slot(slot)
+            mx.clear_cache()
+            steps = steps[2:]  # the first two are warm-up
+            whole = statistics.median(s[0] for s in steps) / n2
+            if n2 == n1:
+                return whole
+            return max(statistics.median(s[0] - s[1] for s in steps) / (n2 - n1), whole * 0.5)
+
         layer_time: dict[int, float] = {}
         try:
-            for b in batch_sizes:
-                times = {}
-                for n in depths:
-                    _set_layers(stage.inner, full_layers[:n])
-                    toks = np.full((b, context), info.pad_token_id, dtype=np.int32)
-                    stage.run(0, "prefill", toks, pad_lens=[0] * b)
-                    step = np.zeros((b, 1), dtype=np.int32)
-                    stage.run(0, "decode", step)
-                    reps = 4
-                    t0 = time.perf_counter()
-                    for _ in range(reps):
-                        stage.run(0, "decode", step)
-                    times[n] = (time.perf_counter() - t0) / reps
-                    stage.reset_slot(0)
-                    mx.clear_cache()
-                if n2 > n1:
-                    dec = max((times[n2] - times[n1]) / (n2 - n1), times[n2] / n2 * 0.5)
-                else:
-                    dec = times[n2] / n2
-                layer_time[int(b)] = dec
-                log.info("profile b=%d: %.2f ms/layer", b, dec * 1e3)
+            per_layer(max(batch_sizes))  # wake the GPU up before measuring anything
+            for b in sorted(batch_sizes):
+                layer_time[int(b)] = per_layer(b)
+            bs = sorted(layer_time)
+            layer_time = dict(zip(bs, _non_decreasing([layer_time[b] for b in bs])))
+            log.info("profile at %d tokens of context: %s", context, ", ".join(f"b{b}={t * 1e3:.2f}ms" for b, t in layer_time.items()))
         finally:
             _set_layers(stage.inner, full_layers)
             stage.unload()

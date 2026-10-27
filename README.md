@@ -85,10 +85,17 @@ Every job runs the same phases automatically: **discover → profile → place �
 load → prefill → decode (rebalancing as needed) → collect**. Nothing is tuned
 by hand.
 
-1. **Profile.** Each Mac measures its seconds per layer per decode step at
-   several micro-batch sizes (marginal cost of extra layers, so fixed overheads
-   cancel) and reports free memory. Every directed link is probed for latency
-   (ping-pong) and bandwidth (4 MB transfers).
+1. **Profile.** One host tokenizes the prompts. Then each Mac measures its
+   seconds per layer per decode step at micro-batch sizes 1 to 128, at the
+   job's typical cache length (mean prompt + half of `--max-tokens`), since
+   attention over a longer cache costs more. Each number is the marginal cost
+   of extra layers, so fixed overheads cancel: steps through two depths
+   alternate, after a GPU warm-up, and the median of 8 paired differences is
+   kept; random input tokens give MoE layers a realistic mix of experts, and
+   the results are smoothed so time never falls as the batch grows (about
+   45 s per Mac for an 8B model). Each Mac also reports free memory, and
+   every directed link is probed for latency (ping-pong) and bandwidth
+   (4 MB transfers).
 2. **Place.** With `L_i` layers on Mac i, `t_i` its time per layer, `w` weight
    bytes per layer, `k` KV bytes per layer per token, `s` fixed cache bytes per
    layer per sequence (linear-attention state), `B` sequences in flight, `c`
@@ -137,7 +144,7 @@ by hand.
 
 Frames are `u32 total_len | u32 header_len | JSON header | tensor bytes`. The
 header carries `type` and, for tensors, `dtype`/`shape`. Control messages
-(server ↔ host): `hello/welcome`, `profile/profile_result`,
+(server ↔ host): `hello/welcome`, `tokenize/tokenized`, `profile/profile_result`,
 `probe_link/probe_result`, `load/loaded`, `start/started`, `feed`,
 `outputs`, `slot_free`, `stats`, `unload/unloaded`, `heartbeat`, `error`,
 `bye`. Ring messages (host ↔ host):

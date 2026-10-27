@@ -61,9 +61,20 @@ def test_cache_sizes_match_allocation(tiny_model):
 
 def test_profile(tiny_model):
     be = Backend(use_chat_template=False)
-    prof = be.profile(str(tiny_model), batch_sizes=(1, 2), probe_layers=1, context=8)
-    assert set(prof["layer_time"]) == {1, 2}
-    assert all(v > 0 for v in prof["layer_time"].values())
+    prof = be.profile(str(tiny_model), batch_sizes=(1, 2, 4), probe_layers=1, context=40)
+    assert set(prof["layer_time"]) == {1, 2, 4}
+    times = [prof["layer_time"][b] for b in (1, 2, 4)]
+    assert all(v > 0 for v in times) and times == sorted(times)
+
+
+def test_profile_noise_is_smoothed():
+    from slugai.backend import _non_decreasing
+
+    assert _non_decreasing([1.0, 2.0, 3.0]) == [1.0, 2.0, 3.0]
+    # a real MacBook Air profile (ms/layer at batch 1, 8, 32, 64): batch 8 measured slower than 32
+    out = _non_decreasing([1.2, 17.5, 13.1, 22.8])
+    assert out == sorted(out) and out[0] == 1.2 and out[-1] == 22.8
+    assert out[1] == out[2] == (17.5 + 13.1) / 2
 
 
 def test_bench_matches_mlx_lm(tiny_model):
