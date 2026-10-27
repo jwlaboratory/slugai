@@ -32,9 +32,6 @@ class Connection:
         self.writer = writer
         self.name = name
         self.bytes_sent = 0
-        self.bytes_received = 0
-        self.frames_sent = 0
-        self.frames_received = 0
         self.last_seen = time.monotonic()
         self._send_lock = asyncio.Lock()
         self._hb_task: Optional[asyncio.Task] = None
@@ -64,7 +61,6 @@ class Connection:
                 self.closed = True
                 raise ConnectionClosed(f"{self.name}: {e}") from e
         self.bytes_sent += n
-        self.frames_sent += 1
         return n
 
     async def recv(self) -> Frame:
@@ -75,8 +71,6 @@ class Connection:
                 self.closed = True
                 raise ConnectionClosed(self.name)
             self.last_seen = time.monotonic()
-            self.frames_received += 1
-            self.bytes_received += f.wire_bytes
             if f.type == "heartbeat":
                 continue
             return f

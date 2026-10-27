@@ -25,8 +25,7 @@ embedding table, the last stage the final norm and lm_head.
 from __future__ import annotations
 
 import itertools
-import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from typing import Iterable, Optional
 
 import numpy as np
@@ -63,9 +62,6 @@ class HostProfile:
     free_mem: int  # bytes usable for weights + KV
     # micro-batch size -> seconds per layer per decode step
     layer_time: dict[int, float]
-    # optional: seconds per layer per 1k prompt tokens during prefill
-    prefill_layer_time_per_token: float = 0.0
-    extra: dict = field(default_factory=dict)
 
     def time_per_layer(self, b: int) -> float:
         """Linear interpolation (and extrapolation) of the profiled points."""
@@ -115,19 +111,10 @@ class Placement:
     def sequences_in_flight(self) -> int:
         return self.micro_batch * self.num_micro_batches
 
-    def stage_of(self, host: str) -> int:
-        return self.order.index(host)
-
     def to_dict(self) -> dict:
         d = asdict(self)
         d["layers"] = [list(x) for x in self.layers]
         return d
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Placement":
-        d = dict(d)
-        d["layers"] = [tuple(x) for x in d["layers"]]
-        return cls(**d)
 
 
 class PlacementError(RuntimeError):
@@ -180,35 +167,6 @@ def best_split(times: list[float], caps: list[int], num_layers: int) -> Optional
     return out, dp[S][num_layers]
 
 
-def _balanced_split_tiebreak(times: list[float], caps: list[int], num_layers: int, bottleneck: float) -> list[int]:
-    """Among splits achieving ``bottleneck``, prefer the one whose stage times are most even.
-
-    best_split returns a valid optimum; here we re-derive the split by filling
-    each stage up to the bottleneck and then handing leftovers to the stage with
-    the most slack, which spreads idle time instead of piling it on one Mac.
-    """
-    S = len(times)
-    layers = [min(caps[i], int(math.floor(bottleneck / times[i] + 1e-9))) for i in range(S)]
-    layers = [max(1, l) for l in layers]
-    total = sum(layers)
-    # too many: trim from the stages with most time
-    while total > num_layers:
-        i = max(range(S), key=lambda j: layers[j] * times[j] if layers[j] > 1 else -1)
-        layers[i] -= 1
-        total -= 1
-    while total < num_layers:
-        cands = [j for j in range(S) if layers[j] < caps[j]]
-        if not cands:
-            break
-        i = min(cands, key=lambda j: (layers[j] + 1) * times[j])
-        layers[i] += 1
-        total += 1
-    if total != num_layers or max(l * t for l, t in zip(layers, times)) > bottleneck * (1 + 1e-9):
-        sp = best_split(times, caps, num_layers)
-        return sp[0] if sp else layers
-    return layers
-
-
 # --------------------------------------------------------------------------- solve
 
 
@@ -241,9 +199,7 @@ def evaluate(
     sp = best_split(times, caps, spec.num_layers)
     if sp is None:
         return None
-    _, bottleneck = sp
-    layers_n = _balanced_split_tiebreak(times, caps, spec.num_layers, bottleneck)
-    return _assemble(spec, links, order, layers_n, times, b, M, context)
+    return _assemble(spec, links, order, sp[0], times, b, M, context)
 
 
 def _assemble(
@@ -345,42 +301,24 @@ def solve(
     if not micro_batch and max_sequences:
         cap = max(1, -(-max_sequences // S))
         bs = sorted({c for c in bs if c <= cap} | {min(cap, max(bs))}, reverse=True)
-    best: Optional[Placement] = None
+    Ms = [num_micro_batches] if num_micro_batches else range(S, max_micro_batches + 1)
+    best: Optional[Placement] = None  # links keep up with the stages
+    fallback: Optional[Placement] = None  # anything that fits, used if nothing does
     for order in itertools.permutations(names):
-        order = list(order)
         for b in bs:
-            Ms = [num_micro_batches] if num_micro_batches else range(S, max_micro_batches + 1)
-            chosen_for_b: Optional[Placement] = None
             for M in Ms:
-                p = evaluate(spec, hosts, links, order, b, M, context)
+                p = evaluate(spec, hosts, links, list(order), b, M, context)
                 if p is None:
                     break  # more micro-batches only need more memory
+                if fallback is None or p.predicted_tok_s > fallback.predicted_tok_s:
+                    fallback = p
                 links_keep_up = max(p.link_times) <= max(p.stage_compute) * 1.05 + 1e-9
-                if not links_keep_up and not micro_batch:
-                    chosen_for_b = None
-                    break  # this b is too big for the links; try a smaller one
-                chosen_for_b = p
+                if (micro_batch or links_keep_up) and (best is None or p.predicted_tok_s > best.predicted_tok_s * (1 + 1e-6)):
+                    best = p
                 no_idle = M * max(max(p.stage_compute), max(p.link_times)) >= sum(p.stage_compute) + sum(p.link_times) - 1e-9
                 if no_idle and not num_micro_batches:
-                    break
-            if chosen_for_b is None:
-                continue
-            if best is None or chosen_for_b.predicted_tok_s > best.predicted_tok_s * (1 + 1e-6):
-                best = chosen_for_b
-            if not micro_batch and best is not None and best.micro_batch == b:
-                # larger micro-batches already failed; a smaller one is only
-                # better if it fits links/memory better, which the loop handles
-                pass
-    if best is None:
-        # fall back: ignore the "links keep up" rule, take anything that fits
-        for order in itertools.permutations(names):
-            for b in bs:
-                for M in ([num_micro_batches] if num_micro_batches else range(S, max_micro_batches + 1)):
-                    p = evaluate(spec, hosts, links, list(order), b, M, context)
-                    if p is None:
-                        break
-                    if best is None or p.predicted_tok_s > best.predicted_tok_s:
-                        best = p
+                    break  # more micro-batches would only use more memory
+    best = best or fallback
     if best is None:
         need = spec.num_layers * spec.layer_bytes + spec.embed_bytes + spec.head_bytes
         have = sum(h.free_mem for h in hosts.values())
@@ -440,8 +378,6 @@ def rebalance_with_measurements(
             name=h.name,
             free_mem=h.free_mem,
             layer_time={k: v * scale for k, v in h.layer_time.items()},
-            prefill_layer_time_per_token=h.prefill_layer_time_per_token,
-            extra=h.extra,
         )
     now = predict(current, spec, hosts2, links)
     proposed = solve(

@@ -9,7 +9,7 @@ import sys
 from typing import Optional
 
 from .. import __version__
-from ..models import apply_models_dir, model_files, resolve_model_path
+from ..models import model_files, resolve_model_path
 from ..net.discovery import DEFAULT_PORT
 
 
@@ -20,7 +20,6 @@ def _check(ok: Optional[bool], label: str, detail: str = "") -> bool:
 
 
 def main(args) -> int:
-    apply_models_dir(args.models_dir)
     good = True
     print(f"slugai {__version__} doctor on {platform.node()} ({platform.platform()}, {platform.machine()})")
     py = sys.version_info
@@ -28,20 +27,13 @@ def main(args) -> int:
 
     is_mac = platform.system() == "Darwin"
     apple = is_mac and platform.machine() == "arm64"
-    _check(True if apple else None, "apple silicon", "yes" if apple else "no — hosts need an Apple-silicon Mac for MLX; the fake backend still works")
+    _check(True if apple else None, "apple silicon", "yes" if apple else "no — hosts need an Apple-silicon Mac for MLX (the server runs anywhere)")
 
     try:
         import mlx.core as mx
 
         dev = str(mx.default_device())
-        info = {}
-        try:
-            info = mx.device_info()
-        except Exception:
-            try:
-                info = mx.metal.device_info()
-            except Exception:
-                pass
+        info = mx.device_info()
         rec = info.get("max_recommended_working_set_size")
         mem = info.get("memory_size")
         detail = f"mlx {mx.__version__}, device {dev}"
@@ -92,16 +84,16 @@ def main(args) -> int:
             ok = mf["config"] and bool(mf["weights"]) and mf["tokenizer"]
             good &= _check(ok, "model", f"{path} — {mf['weight_bytes'] / 1e9:.2f} GB in {len(mf['weights'])} shard(s)" + ("" if ok else " (missing config/weights/tokenizer)"))
             try:
-                from ..backends import get_backend
+                from ..backend import Backend
 
-                be = get_backend("auto")
+                be = Backend()
                 info = be.model_info(args.model)
                 sp = info.spec
                 total = sp.num_layers * sp.layer_bytes + sp.embed_bytes + sp.head_bytes
                 _check(True, "model spec", f"{sp.num_layers} layers, {total / 1e9:.1f} GB of weights, hidden {sp.hidden_size}")
                 free = be.free_memory()
                 fits = total <= free
-                _check(True if fits else None, "fits on this Mac alone", f"{'yes' if fits else 'no'} ({free / 1e9:.1f} GB free) — " + ("bench single will work" if fits else "needs the ring (or bench streaming)"))
+                _check(True if fits else None, "fits on this Mac alone", f"{'yes' if fits else 'no'} ({free / 1e9:.1f} GB free) — " + ("slugai bench will work" if fits else "needs the ring"))
             except Exception as e:
                 _check(None, "model spec", f"could not inspect: {e}")
     print("all good" if good else "problems found")

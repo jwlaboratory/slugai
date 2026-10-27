@@ -45,9 +45,8 @@ add `--limit N` for a quick try.
 | --- | --- |
 | `slugai host` | start on each MacBook; blocks sleep and waits for the server |
 | `slugai run --model M [--prompts P]` | start a job on the server |
-| `slugai bench single\|streaming --model M [--prompts P]` | run a baseline on the same prompts |
+| `slugai bench --model M [--prompts P]` | baseline: the same prompts on one Mac holding every layer |
 | `slugai prep-model M` | stage model files on this Mac |
-| `slugai profile --model M` | profile one Mac (time per layer, memory) |
 | `slugai doctor [--model M]` | check a Mac's setup |
 
 Prompts: a `.txt` with one prompt per line, or `.jsonl` with `{"prompt": ...}`.
@@ -73,7 +72,7 @@ MacBook-C > MacBook-A  0.2 KB/s    9.0 MB/s   token ids
 41.0 tok/s · 148k tok/h · 61% of peak
 1,212 / 3,000 sequences · 4 micro-batches x 64 · 310,272 tokens
 
-[p] pause  [r] rebalance  [s] save report  [q] quit
+[r] rebalance  [s] save report  [q] quit
 ```
 
 `--no-tui` prints the same numbers as log lines instead. `[q]` (or Ctrl+Q, or
@@ -127,12 +126,12 @@ by hand.
 | `slugai/cli.py`, `__main__.py` | `slugai` command (also `python -m slugai`) |
 | `slugai/placement.py` | layer split, ring order, micro-batch choice, rebalance |
 | `slugai/prompts.py`, `data/` | prompt files; the built-in sample prompts |
-| `slugai/models.py` | model files on a host (`prep-model`, `--models-dir`) |
+| `slugai/models.py` | model files on a host (`prep-model`; they live in the Hugging Face cache, set `HF_HOME` to move it) |
+| `slugai/backend.py` | runs a range of a real model's layers with MLX: stage, tokenizer, model sizes, profiling |
 | `slugai/net/` | `protocol` (frames: JSON header + optional tensor), `transport` (asyncio connections, heartbeats), `discovery` (Bonjour) |
-| `slugai/backends/` | `base` (`Stage`/`Backend` interface), `fake` (numpy toy model for tests), `mlx` (real models via mlx-lm) |
 | `slugai/ring/` | `host` (daemon: profile, link probes, load layers, run a stage), `server` (coordinator: discover → collect, rebalance), `dashboard` (Textual screen / plain logs) |
-| `slugai/tools/` | `bench` (`single` and FlexGen-style `streaming` baselines), `doctor`, `profiling` |
-| `tests/` | unit, end-to-end (fake backend, real sockets) and MLX tests; `helpers.py`, `tiny_model.py` |
+| `slugai/tools/` | `bench` (the single-Mac baseline), `doctor` |
+| `tests/` | unit tests, backend tests and end-to-end ring tests on tiny real models built on disk (`tiny_model.py`, `conftest.py`, `helpers.py`) |
 
 ### Wire protocol
 
@@ -140,13 +139,13 @@ Frames are `u32 total_len | u32 header_len | JSON header | tensor bytes`. The
 header carries `type` and, for tensors, `dtype`/`shape`. Control messages
 (server ↔ host): `hello/welcome`, `profile/profile_result`,
 `probe_link/probe_result`, `load/loaded`, `start/started`, `feed`,
-`outputs`, `slot_free`, `stats`, `pause/resume`, `unload/unloaded`,
-`ping/pong`, `heartbeat`, `error`, `bye`. Ring messages (host ↔ host):
+`outputs`, `slot_free`, `stats`, `unload/unloaded`, `heartbeat`, `error`,
+`bye`. Ring messages (host ↔ host):
 `peer_hello`, `hidden` (per slot, in the model's dtype; bf16 travels as its
 raw 16 bits), `tokens` (int32, last stage → stage 1),
 `link_probe/link_probe_ack`.
 
-### MLX backend
+### Backend
 
 Built on mlx-lm so every architecture it supports works without per-model
 code: the model is loaded lazily, `model.model.layers` is sliced to the
@@ -162,30 +161,28 @@ break the batch caches.
 ## Development
 
 ```
-uv venv .venv && uv pip install -p .venv/bin/python -e ".[dev]"
+uv venv .venv && uv pip install -p .venv/bin/python -e ".[dev,mlx]" transformers
 .venv/bin/python -m pytest
 ```
 
-The suite runs without MLX: a numpy fake backend (a small causal transformer
-with real KV caches and padding masks) stands in for the model, so the ring,
-scheduling, rebalancing and placement are exercised end to end on one machine
-with real sockets. `slugai host --backend fake` runs the same thing by hand.
-
-The MLX backend has its own tests that build tiny Qwen3 (fp16 and 4-bit) and
-Qwen3-Next (linear attention + MoE) models on disk and check that the 3-stage
-ring reproduces mlx-lm's greedy tokens exactly. On Apple silicon install
-`-e ".[dev,mlx]" transformers`; on Linux use the CPU build:
-`pip install "mlx[cpu]" mlx-lm transformers`.
+The tests build tiny random Qwen3 (fp16 and 4-bit) and Qwen3-Next (linear
+attention + MoE) models on disk in milliseconds and run everything on them:
+the ring end to end with real sockets (it must reproduce mlx-lm's greedy
+tokens exactly), rebalancing, the dashboard, the baseline and the CLI. They
+need MLX: Apple silicon, or on Linux the CPU build
+(`pip install "mlx[cpu]" mlx-lm transformers`). Without MLX only the
+placement, protocol, CLI, `doctor` and `prep-model` tests run; the rest are
+skipped.
 
 To try a real ring on one Mac, start three hosts on different ports and point
-a job at them, then check the tokens against `bench single` with the same
+a job at them, then check the tokens against `slugai bench` with the same
 batch size:
 
 ```
 for p in 47201 47202 47203; do slugai host --port $p --name mac$p --no-advertise & done
 slugai run --model mlx-community/Qwen3-8B-4bit --hosts 127.0.0.1:47201,127.0.0.1:47202,127.0.0.1:47203 \
     --limit 120 --max-tokens 64 --micro-batch 32 --num-micro-batches 3 --no-tui
-slugai bench single --model mlx-community/Qwen3-8B-4bit --limit 120 --max-tokens 64 --batch 32
+slugai bench --model mlx-community/Qwen3-8B-4bit --limit 120 --max-tokens 64 --batch 32
 ```
 
 Each host reports the whole Mac's free memory, so pin the micro-batches as
@@ -193,7 +190,7 @@ above: left to itself, placement would over-commit the shared memory.
 
 ## Prior work
 
-- [FlexGen](https://arxiv.org/abs/2303.06865): throughput-first inference by streaming weights; the basis of `bench streaming`.
+- [FlexGen](https://arxiv.org/abs/2303.06865): throughput-first inference on one machine by streaming weights from disk.
 - [GPipe](https://arxiv.org/abs/1811.06965): micro-batch pipelining, the scheduling idea behind the ring.
 - [TD-Pipe](https://arxiv.org/abs/2506.10470): separate prefill and decode phases to remove pipeline bubbles.
 - [Helix](https://arxiv.org/abs/2406.01566): layer placement on uneven GPUs and links as a max-flow problem.

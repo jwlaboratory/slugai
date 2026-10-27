@@ -1,22 +1,80 @@
-"""Shared test helpers."""
+"""Shared test helpers (MLX test modules only)."""
 
-import numpy as np
+import time
+
+from slugai.backend import Backend
+from slugai.net.discovery import HostAddr
+from slugai.ring.host import HostDaemon
+
+PROMPTS = [
+    "the quick brown fox",
+    "hi",
+    "a much longer prompt than the others, indeed",
+    "zebra",
+    "once upon a time",
+    "numbers 1 2 3 4 5",
+    "short",
+    "Why is the sky blue? Tell me in one sentence.",
+    "x",
+    "The end.",
+    "lorem ipsum dolor sit amet",
+]
 
 
-def reference_generate(backend, model_id, prompts, max_tokens):
-    """Whole model in one stage; batch of 1 per prompt (no padding at all)."""
-    info = backend.model_info(model_id)
-    tok = backend.tokenizer(model_id)
-    stage = backend.load_stage(model_id, (0, info.spec.num_layers), first=True, last=True)
+class SlowBackend(Backend):
+    """The real backend plus a sleep of ``ms`` per layer per step.
+
+    Puts step times under the test's control: raising ``ms`` mid-job throttles
+    the host, and it stays slow across reloads because every stage reads it.
+    """
+
+    def __init__(self, ms: float = 0.0):
+        super().__init__(use_chat_template=False)
+        self.ms = ms
+
+    def load_stage(self, *args, **kwargs):
+        stage = super().load_stage(*args, **kwargs)
+        run = stage.run
+
+        def slow_run(*a, **kw):
+            out = run(*a, **kw)
+            time.sleep(self.ms / 1000 * len(stage.inner.layers))
+            return out
+
+        stage.run = slow_run
+        return stage
+
+
+async def start_hosts(n, backend_factory=lambda i: Backend(use_chat_template=False), host_class=HostDaemon):
+    hosts = []
+    for i in range(n):
+        d = host_class(f"mac{i}", 0, backend_factory(i), advertise=False, ip="127.0.0.1")
+        await d.start()
+        hosts.append(d)
+    return hosts
+
+
+def addrs(hosts):
+    return [HostAddr(d.name, "127.0.0.1", d.port) for d in hosts]
+
+
+def one_machine(model_path, prompts, max_tokens, batch):
+    """Greedy tokens with the whole model on one stage, in the same batches the ring uses."""
+    from slugai.tools.bench import run_single
+
+    outs, _ = run_single(Backend(use_chat_template=False), str(model_path), prompts, max_tokens=max_tokens, batch=batch)
+    return outs
+
+
+def mlx_lm_reference(model_path, prompts, max_tokens):
+    """Greedy token ids from mlx-lm's own generator, one prompt at a time (EOS stripped)."""
+    from mlx_lm import load
+    from mlx_lm.generate import stream_generate
+    from mlx_lm.sample_utils import make_sampler
+
+    model, tok = load(str(model_path))
     outs = []
-    for i, p in enumerate(prompts):
-        ids = np.array([tok.encode(p)], dtype=np.int32)
-        nxt = stage.run(i, "prefill", ids, pad_lens=[0])
-        gen = [int(nxt[0])]
-        for _ in range(max_tokens - 1):
-            if gen[-1] in info.eos_token_ids:
-                break
-            nxt = stage.run(i, "decode", nxt.reshape(1, 1))
-            gen.append(int(nxt[0]))
-        outs.append(gen)
+    for p in prompts:
+        ids = [r.token for r in stream_generate(model, tok, prompt=p, max_tokens=max_tokens, sampler=make_sampler(temp=0.0))]
+        outs.append([t for t in ids if t not in tok.eos_token_ids])
     return outs

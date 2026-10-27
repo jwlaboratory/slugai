@@ -1,1 +1,1 @@
-"""Commands around the ring: ``bench`` baselines, ``doctor``, ``profile``."""
+"""Commands around the ring: the ``bench`` baseline and ``doctor``."""

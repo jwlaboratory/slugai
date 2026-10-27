@@ -15,7 +15,7 @@ Message types (``type`` field):
 control (server <-> host)
     hello/welcome, profile/profile_result, probe_link/probe_result,
     load/loaded, start/started, feed, outputs, slot_free, stats,
-    pause/resume, unload/unloaded, ping/pong, heartbeat, error, bye
+    unload/unloaded, heartbeat, error, bye
 data (host <-> host, around the ring)
     peer_hello, hidden (carries a tensor), tokens, link_probe/link_probe_ack, bye
 """
@@ -40,7 +40,6 @@ class Frame:
     type: str
     body: dict[str, Any] = field(default_factory=dict)
     tensor: Optional[np.ndarray] = None
-    wire_bytes: int = field(default=0, compare=False)  # set by the reader, informational
 
     def __getitem__(self, key: str) -> Any:
         return self.body[key]
@@ -80,33 +79,9 @@ class Frame:
             raise ValueError("payload without tensor metadata")
         return cls(typ, header, tensor)
 
-    def nbytes(self) -> int:
-        return len(self.encode())
-
 
 def pack(type: str, tensor: Optional[np.ndarray] = None, **body: Any) -> Frame:
     return Frame(type, body, tensor)
-
-
-class FrameParser:
-    """Incremental parser for a byte stream of frames (for non-asyncio uses)."""
-
-    def __init__(self) -> None:
-        self._buf = bytearray()
-
-    def feed(self, data: bytes) -> list[Frame]:
-        self._buf.extend(data)
-        out: list[Frame] = []
-        while True:
-            if len(self._buf) < 4:
-                break
-            (total,) = struct.unpack("!I", self._buf[:4])
-            if len(self._buf) < 4 + total:
-                break
-            chunk = bytes(self._buf[4 : 4 + total])
-            del self._buf[: 4 + total]
-            out.append(Frame.decode(chunk))
-        return out
 
 
 async def read_frame(reader) -> Optional[Frame]:
@@ -120,9 +95,7 @@ async def read_frame(reader) -> Optional[Frame]:
         data = await reader.readexactly(total)
     except Exception:
         return None
-    f = Frame.decode(data)
-    f.wire_bytes = 4 + total
-    return f
+    return Frame.decode(data)
 
 
 async def write_frame(writer, frame: Frame) -> int:

@@ -12,7 +12,7 @@
     41 tok/s · 148k tok/h · 61% of peak
     1,212 / 3,000 sequences · 4 micro-batches x 64
 
-    [p] pause  [r] rebalance  [s] save report  [q] quit
+    [r] rebalance  [s] save report  [q] quit
 """
 
 from __future__ import annotations
@@ -57,8 +57,6 @@ def render(server: "Server") -> str:
     nh = len(st.hosts)
     lines.append(f"slugai · job {st.job} · {st.model} · {nh} host{'s' if nh != 1 else ''}")
     phase = f"phase {st.phase_index + 1}/7 {st.phase}"
-    if st.paused:
-        phase += " (paused)"
     lines.append(f"{phase:<24} elapsed {_hms(st.elapsed):>8}   ETA {_hms(st.eta):>8}")
     lines.append("")
     name_w = max(10, max((len(n) for n in st.hosts), default=4))
@@ -92,7 +90,7 @@ def render(server: "Server") -> str:
     for ts, msg in list(st.events)[-6:]:
         lines.append(f"{time.strftime('%H:%M:%S', time.localtime(ts))}  {msg}")
     lines.append("")
-    lines.append("[p] pause  [r] rebalance  [s] save report  [q] quit")
+    lines.append("[r] rebalance  [s] save report  [q] quit")
     return "\n".join(lines)
 
 
@@ -161,7 +159,7 @@ async def run_tui(server: "Server", headless: bool = False) -> int:
 
     class Dashboard(App):
         CSS = "Screen { background: $background; } #screen { padding: 1 2; }"
-        BINDINGS = [("p", "pause", "pause"), ("r", "rebalance", "rebalance"), ("s", "save", "save report"), ("q", "quit_job", "quit")]
+        BINDINGS = [("r", "rebalance", "rebalance"), ("s", "save", "save report"), ("q", "quit_job", "quit")]
 
         def compose(self) -> ComposeResult:
             yield Static(render(server), id="screen", markup=False)
@@ -175,12 +173,6 @@ async def run_tui(server: "Server", headless: bool = False) -> int:
             if server.state.finished and self.job_task.done() and not getattr(self, "_exiting", False):
                 self._exiting = True
                 self.set_timer(0.2 if headless else 2.0, self.exit)
-
-        async def action_pause(self) -> None:
-            if server.state.paused:
-                await server.resume()
-            else:
-                await server.pause()
 
         def action_rebalance(self) -> None:
             if not server.maybe_rebalance(force=True):

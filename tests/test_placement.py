@@ -4,7 +4,7 @@ import pytest
 
 from slugai.placement import (
     HostProfile, LinkProfile, ModelSpec, Placement, PlacementError,
-    best_split, evaluate, rebalance_with_measurements, should_rebalance, solve,
+    best_split, rebalance_with_measurements, should_rebalance, solve,
 )
 
 GB = 1 << 30
@@ -75,8 +75,6 @@ def test_solve_doc_example():
     assert n["A"] > n["C"] and n["B"] > n["C"]
     assert p.micro_batch >= 8 and p.num_micro_batches >= 3
     assert 0 < p.predicted_tok_s <= p.peak_tok_s + 1e-9
-    # roundtrip
-    assert Placement.from_dict(p.to_dict()) == p
 
 
 def test_links_keep_up_rule_shrinks_micro_batch():

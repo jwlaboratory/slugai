@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from slugai.net.protocol import Frame, FrameParser, pack
+from slugai.net.protocol import Frame, pack
 
 
 def test_roundtrip_no_tensor():
@@ -28,18 +28,6 @@ def test_roundtrip_int_tensor():
     t = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
     g = Frame.decode(pack("tokens", tensor=t).encode()[4:])
     np.testing.assert_array_equal(g.tensor, t)
-
-
-def test_parser_handles_split_and_concatenated_frames():
-    frames = [pack("a", i=i, tensor=np.ones((i + 1,), np.float16)) for i in range(5)]
-    blob = b"".join(f.encode() for f in frames)
-    parser = FrameParser()
-    out = []
-    # feed in awkward chunks
-    for i in range(0, len(blob), 7):
-        out.extend(parser.feed(blob[i : i + 7]))
-    assert [f["i"] for f in out] == [0, 1, 2, 3, 4]
-    assert out[4].tensor.shape == (5,)
 
 
 def test_payload_without_metadata_rejected():

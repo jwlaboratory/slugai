@@ -4,7 +4,7 @@ It profiles itself, loads its layers, runs its pipeline stage and streams
 stats. Two kinds of connection arrive on its port:
 
 * **control** (first frame ``hello``) from the server: profile, probe_link,
-  load, start, feed, pause, resume, unload, bye;
+  load, start, feed, unload, bye;
 * **data** (first frame ``peer_hello``) from the previous stage in the ring
   (``hidden`` frames), from the last stage (``tokens`` frames to stage 1), or a
   link probe.
@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from .. import __version__
-from ..backends import Backend, ModelInfo, Stage, Tokenizer, get_backend
+from ..backend import Backend, ModelInfo, Stage, Tokenizer
 from ..net.discovery import Advertiser
 from ..net.protocol import Frame, pack
 from ..net.transport import Connection, ConnectionClosed, connect, local_ip, serve
@@ -54,7 +54,6 @@ class SlotState:
     ids: list[int]
     gen: list[list[int]] = field(default_factory=list)
     done: list[bool] = field(default_factory=list)
-    started: float = field(default_factory=time.monotonic)
     prompt_tokens: Optional[list[int]] = None
 
 
@@ -63,12 +62,10 @@ class StatsWindow:
         self.window = window
         self.events: list[tuple[float, float, int, str]] = []  # (t_end, dt, b, phase)
         self.tokens_generated = 0
-        self.total_busy = 0.0
         self.started = time.monotonic()
 
     def record(self, dt: float, b: int, phase: str) -> None:
         self.events.append((time.monotonic(), dt, b, phase))
-        self.total_busy += dt
         cutoff = time.monotonic() - self.window
         while self.events and self.events[0][0] < cutoff:
             self.events.pop(0)
@@ -84,9 +81,7 @@ class StatsWindow:
         return {
             "busy": min(1.0, busy),
             "step": statistics.fmean(decode) if decode else (statistics.fmean(prefill) if prefill else 0.0),
-            "prefill_step": statistics.fmean(prefill) if prefill else 0.0,
             "tokens_generated": self.tokens_generated,
-            "total_busy": self.total_busy,
         }
 
 
@@ -106,9 +101,6 @@ class HostDaemon:
         self.queue: asyncio.Queue[Work] = asyncio.Queue()
         self.worker_task: Optional[asyncio.Task] = None
         self.stats_task: Optional[asyncio.Task] = None
-        self.paused = asyncio.Event()
-        self.paused.set()
-        self.running = False
         self.stats = StatsWindow()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stage")
         self.slot_state: dict[int, SlotState] = {}
@@ -121,13 +113,13 @@ class HostDaemon:
         self.server = await serve(self._on_connection, "0.0.0.0", self.port)
         self.port = self.server.sockets[0].getsockname()[1]
         if self.advertise:
-            self._advertiser = Advertiser(self.name, self.port, {"backend": self.backend.name, "version": __version__}, ip=self.ip)
+            self._advertiser = Advertiser(self.name, self.port, {"version": __version__}, ip=self.ip)
             try:
                 await self._advertiser.start()
             except Exception as e:  # Bonjour is optional (e.g. no multicast)
                 log.warning("Bonjour advertising failed (%s); use --hosts on the server", e)
                 self._advertiser = None
-        log.info("host %s listening on %s:%d (backend %s)", self.name, self.ip, self.port, self.backend.name)
+        log.info("host %s listening on %s:%d", self.name, self.ip, self.port)
 
     async def stop(self) -> None:
         if self._advertiser:
@@ -170,12 +162,8 @@ class HostDaemon:
                 name=self.name,
                 ip=self.ip,
                 port=self.port,
-                backend=self.backend.name,
-                version=__version__,
                 free_mem=self.backend.free_memory(),
                 total_mem=self.backend.total_memory(),
-                platform=platform.platform(),
-                machine=platform.machine(),
             )
         )
         # Keep reading while a long request (profile, load) runs, so heartbeats are
@@ -221,22 +209,15 @@ class HostDaemon:
         elif t == "load":
             await conn.send(await self._load(f))
         elif t == "start":
-            self.running = True
             self.stats = StatsWindow()
             if self.stats_task is None:
                 self.stats_task = asyncio.create_task(self._stats_loop())
             await conn.send(pack("started"))
         elif t == "feed":
             await self._feed(f)
-        elif t == "pause":
-            self.paused.clear()
-        elif t == "resume":
-            self.paused.set()
         elif t == "unload":
             await self._unload()
-            await conn.send(pack("unloaded", free_mem=self.backend.free_memory()))
-        elif t == "ping":
-            await conn.send(pack("pong", t=f.get("t")))
+            await conn.send(pack("unloaded"))
         elif t == "bye":
             return True
         else:
@@ -260,12 +241,10 @@ class HostDaemon:
             lengths = [len(tok.encode(p)) for p in f["prompts"]]
         return pack(
             "profile_result",
-            name=self.name,
             layer_time={str(k): v for k, v in prof["layer_time"].items()},
-            prefill_layer_time_per_token=prof["prefill_layer_time_per_token"],
             free_mem=prof["free_mem"],
             total_mem=self.backend.total_memory(),
-            model_info=info.to_dict(),
+            spec=info.spec.__dict__,
             prompt_lengths=lengths,
         )
 
@@ -297,7 +276,7 @@ class HostDaemon:
             await conn.send(pack("bye"))
             await conn.close()
         log.info("link %s -> %s:%d: %.1f MB/s, %.1f ms", self.name, host, port, best / 1e6, latency * 1e3)
-        return pack("probe_result", source=self.name, host=host, port=port, bandwidth=best, latency=latency, nbytes=nbytes)
+        return pack("probe_result", bandwidth=best, latency=latency)
 
     async def _load(self, f: Frame) -> Frame:
         await self._unload()
@@ -321,10 +300,9 @@ class HostDaemon:
         if self.worker_task is None:
             self.worker_task = asyncio.create_task(self._worker())
         log.info("loaded in %.1fs, memory used %.2f GB", load_s, self.stage.memory_used() / 1e9)
-        return pack("loaded", name=self.name, stage=stage_idx, layers=[a, b], load_seconds=load_s, mem_used=self.stage.memory_used(), free_mem=self.backend.free_memory())
+        return pack("loaded", load_seconds=load_s, mem_used=self.stage.memory_used())
 
     async def _unload(self) -> None:
-        self.running = False
         while not self.queue.empty():
             self.queue.get_nowait()
         if self.next_conn is not None:
@@ -339,7 +317,6 @@ class HostDaemon:
             # on the stage thread, so it waits for a step still running there
             await asyncio.get_running_loop().run_in_executor(self.executor, stage.unload)
         self.slot_state.clear()
-        self.paused.set()
 
     async def _teardown(self) -> None:
         await self._unload()
@@ -358,7 +335,7 @@ class HostDaemon:
         Every prompt is split into ``prompt[:-1]`` (one padded prefill frame)
         and its last token (a decode frame), so after prefill all sequences in
         the micro-batch are aligned and the first generated token comes out of
-        an ordinary decode step. The padding side is the backend's choice.
+        an ordinary decode step. Prompts are right-padded, as mlx-lm does.
         """
         if self.stage is None or not self.stage.first:
             raise RuntimeError("feed sent to a host that is not stage 1")
@@ -368,7 +345,6 @@ class HostDaemon:
         if max_prompt:
             enc = [e[-int(max_prompt):] for e in enc]
         enc = [e if e else [self.info.pad_token_id] for e in enc]
-        side = getattr(self.backend, "padding_side", "left")
         base = {"slot": slot, "ids": list(ids), "prompt_tokens": [len(e) for e in enc]}
         T = max(len(e) for e in enc)
         if T > 1:
@@ -377,10 +353,7 @@ class HostDaemon:
             arr = np.full((len(body), Tb), self.info.pad_token_id, dtype=np.int32)
             pad_lens = []
             for i, e in enumerate(body):
-                if side == "left":
-                    arr[i, Tb - len(e):] = e
-                else:
-                    arr[i, : len(e)] = e
+                arr[i, : len(e)] = e
                 pad_lens.append(Tb - len(e))
             meta = dict(base, phase="prefill", pad_lens=pad_lens, emit=False)
             await self.queue.put(Work(slot, "prefill", arr, pad_lens, meta))
@@ -397,7 +370,6 @@ class HostDaemon:
         try:
             while True:
                 w = await self.queue.get()
-                await self.paused.wait()
                 stage = self.stage
                 if stage is None:
                     continue
@@ -458,7 +430,7 @@ class HostDaemon:
             texts = [self.tok.decode(g) for g in st.gen]
             if self.server_conn is not None:
                 await self.server_conn.send(
-                    pack("outputs", slot=slot, ids=st.ids, tokens=st.gen, texts=texts, prompt_tokens=st.prompt_tokens, seconds=time.monotonic() - st.started)
+                    pack("outputs", slot=slot, ids=st.ids, tokens=st.gen, texts=texts, prompt_tokens=st.prompt_tokens)
                 )
             del self.slot_state[slot]
             await self._deliver_to_first(pack("tokens", slot=slot, done=True))
@@ -495,7 +467,6 @@ class HostDaemon:
                     return
                 if f.type == "link_probe":
                     await conn.send(pack("link_probe_ack", seq=f.get("seq")))
-            return
         log.info("ring peer %s connected", conn.name)
         try:
             while True:
@@ -529,19 +500,13 @@ class HostDaemon:
                     await self.server_conn.send(
                         pack(
                             "stats",
-                            name=self.name,
-                            stage=self.job.get("stage"),
                             busy=snap["busy"],
                             step=snap["step"],
-                            prefill_step=snap["prefill_step"],
                             tokens_generated=snap["tokens_generated"],
-                            total_busy=snap["total_busy"],
                             mem_used=mem_used,
                             mem_total=self.backend.total_memory(),
                             bytes_out=self.next_conn.bytes_sent if self.next_conn else 0,
                             queue=self.queue.qsize(),
-                            slots=len(self.slot_state),
-                            paused=not self.paused.is_set(),
                         )
                     )
                 except ConnectionClosed:
@@ -560,10 +525,7 @@ def _caffeinate() -> Optional[subprocess.Popen]:
 
 
 async def main(args) -> int:
-    from ..models import apply_models_dir
-
-    apply_models_dir(args.models_dir)
-    backend = get_backend(args.backend)
+    backend = Backend()
     name = args.name or socket.gethostname().split(".")[0]
     daemon = HostDaemon(name, args.port, backend, advertise=not args.no_advertise)
     caff = None if args.no_caffeinate else _caffeinate()

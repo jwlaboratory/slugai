@@ -1,43 +1,16 @@
 """Model files on a host (``slugai prep-model``).
 
-Model files live in the Hugging Face cache, where mlx-lm expects them.
-``--models-dir`` points that cache somewhere else (it sets ``HF_HUB_CACHE``),
-so every slugai command that takes ``--models-dir`` must apply it before MLX or
-mlx-lm are imported.
+Model files live in the Hugging Face cache, where mlx-lm expects them (set
+``HF_HOME`` to move it).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
-
-DEFAULT_MODELS_DIR = Path.home() / ".slugai" / "models"
-
-
-def apply_models_dir(models_dir: Optional[str]) -> Optional[Path]:
-    if not models_dir:
-        return None
-    p = Path(models_dir).expanduser()
-    p.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HUB_CACHE"] = str(p)
-    os.environ.setdefault("HF_HOME", str(p.parent))
-    return p
-
-
-def dir_size(path: Path) -> int:
-    total = 0
-    for f in path.rglob("*"):
-        try:
-            if f.is_file() or f.is_symlink():
-                total += f.stat().st_size
-        except OSError:
-            pass
-    return total
-
 
 def model_files(path: Path) -> dict:
     """What is present for a model directory: config, weights, tokenizer."""
@@ -52,9 +25,8 @@ def model_files(path: Path) -> dict:
     }
 
 
-def prep_model(model: str, models_dir: Optional[str] = None) -> int:
+def prep_model(model: str) -> int:
     """Download (or verify) model files so ``slugai host`` can load them without network."""
-    apply_models_dir(models_dir)
     local = Path(model).expanduser()
     if local.exists():
         info = model_files(local)
