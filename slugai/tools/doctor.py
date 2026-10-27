@@ -8,9 +8,9 @@ import socket
 import sys
 from typing import Optional
 
-from . import __version__
-from .cli import DEFAULT_PORT
-from .models import apply_models_dir, model_files, resolve_model_path
+from .. import __version__
+from ..models import apply_models_dir, model_files, resolve_model_path
+from ..net.discovery import DEFAULT_PORT
 
 
 def _check(ok: Optional[bool], label: str, detail: str = "") -> bool:
@@ -68,7 +68,7 @@ def main(args) -> int:
         except ImportError:
             good &= _check(False, mod, "missing")
 
-    from .transport import local_ip
+    from ..net.transport import local_ip
 
     ip = local_ip()
     _check(ip != "127.0.0.1", "network", f"this Mac is {ip}" if ip != "127.0.0.1" else "no LAN address found")
@@ -92,7 +92,7 @@ def main(args) -> int:
             ok = mf["config"] and bool(mf["weights"]) and mf["tokenizer"]
             good &= _check(ok, "model", f"{path} — {mf['weight_bytes'] / 1e9:.2f} GB in {len(mf['weights'])} shard(s)" + ("" if ok else " (missing config/weights/tokenizer)"))
             try:
-                from .backend import get_backend
+                from ..backends import get_backend
 
                 be = get_backend("auto")
                 info = be.model_info(args.model)

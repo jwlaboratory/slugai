@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from slugai.protocol import Frame, FrameParser, pack
+from slugai.net.protocol import Frame, FrameParser, pack
 
 
 def test_roundtrip_no_tensor():
@@ -51,7 +51,7 @@ def test_payload_without_metadata_rejected():
 @pytest.mark.asyncio
 async def test_asyncio_stream_roundtrip():
     import asyncio
-    from slugai.protocol import read_frame, write_frame
+    from slugai.net.protocol import read_frame, write_frame
 
     got = []
 

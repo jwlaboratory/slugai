@@ -13,9 +13,9 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("mlx_lm")
 
-from slugai.discovery import HostAddr  # noqa: E402
-from slugai.host import HostDaemon  # noqa: E402
-from slugai.server import Server  # noqa: E402
+from slugai.net.discovery import HostAddr  # noqa: E402
+from slugai.ring.host import HostDaemon  # noqa: E402
+from slugai.ring.server import Server  # noqa: E402
 from tests.tiny_model import make_tiny_qwen3, make_tiny_qwen3_next  # noqa: E402
 
 PROMPTS = ["hello world", "the quick brown fox", "zebra", "a", "once upon a time there was", "x y z"]
@@ -45,7 +45,7 @@ def mlx_lm_reference(model_path, prompts, max_tokens):
 
 
 def test_model_info_and_stage_shapes(tiny_model):
-    from slugai.mlx_backend import MLXBackend
+    from slugai.backends.mlx import MLXBackend
 
     be = MLXBackend(use_chat_template=False)
     info = be.model_info(str(tiny_model))
@@ -78,7 +78,7 @@ def test_model_info_and_stage_shapes(tiny_model):
 def test_cache_sizes_match_allocation(tiny_model):
     """The spec's KV + state sizes (placement's memory model) match what a stage really allocates."""
     from mlx.utils import tree_flatten
-    from slugai.mlx_backend import MLXBackend
+    from slugai.backends.mlx import MLXBackend
 
     be = MLXBackend(use_chat_template=False)
     sp = be.model_info(str(tiny_model)).spec
@@ -92,7 +92,7 @@ def test_cache_sizes_match_allocation(tiny_model):
 
 
 def test_profile(tiny_model):
-    from slugai.mlx_backend import MLXBackend
+    from slugai.backends.mlx import MLXBackend
 
     be = MLXBackend(use_chat_template=False)
     prof = be.profile(str(tiny_model), batch_sizes=(1, 2), probe_layers=1, context=8)
@@ -102,7 +102,7 @@ def test_profile(tiny_model):
 
 @pytest.mark.asyncio
 async def test_ring_matches_mlx_lm_generate(tiny_model, tmp_path):
-    from slugai.mlx_backend import MLXBackend
+    from slugai.backends.mlx import MLXBackend
 
     max_tokens = 8
     ref = mlx_lm_reference(tiny_model, PROMPTS, max_tokens)
@@ -131,8 +131,8 @@ async def test_ring_matches_mlx_lm_generate(tiny_model, tmp_path):
 
 
 def test_bench_baselines_match_mlx_lm(tiny_model):
-    from slugai.bench import run_single, run_streaming
-    from slugai.mlx_backend import MLXBackend
+    from slugai.tools.bench import run_single, run_streaming
+    from slugai.backends.mlx import MLXBackend
 
     ref = mlx_lm_reference(tiny_model, PROMPTS, 6)
     be = MLXBackend(use_chat_template=False)

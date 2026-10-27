@@ -1,4 +1,4 @@
-"""asyncio connections carrying :mod:`slugai.protocol` frames.
+"""asyncio connections carrying :mod:`slugai.net.protocol` frames.
 
 A :class:`Connection` wraps a StreamReader/StreamWriter pair, counts bytes in
 both directions, and answers heartbeats transparently. Control connections

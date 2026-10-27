@@ -14,5 +14,5 @@ def test_parser_subcommands():
 
 
 def test_help_runs():
-    out = subprocess.run([sys.executable, "-m", "slugai.cli", "--help"], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, "-m", "slugai", "--help"], capture_output=True, text=True)
     assert out.returncode == 0 and "host" in out.stdout

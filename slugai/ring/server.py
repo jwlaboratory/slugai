@@ -24,10 +24,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import __version__
-from .backend import ModelInfo
-from .discovery import HostAddr, browse, parse_hosts
-from .placement import (
+from .. import __version__
+from ..backends import ModelInfo
+from ..net.discovery import HostAddr, browse, parse_hosts
+from ..placement import (
     HostProfile,
     LinkProfile,
     ModelSpec,
@@ -38,9 +38,9 @@ from .placement import (
     should_rebalance,
     solve,
 )
-from .prompts import load_prompts
-from .protocol import Frame, pack
-from .transport import Connection, ConnectionClosed, connect
+from ..net.protocol import Frame, pack
+from ..net.transport import Connection, ConnectionClosed, connect
+from ..prompts import load_prompts
 
 log = logging.getLogger(__name__)
 
@@ -620,7 +620,7 @@ async def main(args) -> int:
     if not prompts:
         log.error("no prompts in %s", args.prompts)
         return 2
-    hosts = parse_hosts(args.hosts, 47111) if args.hosts else None
+    hosts = parse_hosts(args.hosts) if args.hosts else None
     server = Server(
         model=args.model,
         prompts=prompts,

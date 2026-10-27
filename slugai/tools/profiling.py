@@ -3,7 +3,7 @@
 Prints seconds per layer per decode step for several micro-batch sizes, the
 prefill cost, and free memory. The host daemon runs the same measurement on
 the server's request (``profile`` message) and link probes are measured
-between hosts (``probe_link``); see :mod:`slugai.host`.
+between hosts (``probe_link``); see :mod:`slugai.ring.host`.
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ import json
 import platform
 import time
 
-from .models import apply_models_dir
+from ..models import apply_models_dir
 
 
 def profile_cli(args) -> int:
     apply_models_dir(args.models_dir)
-    from .backend import get_backend
+    from ..backends import get_backend
 
     backend = get_backend(args.backend)
     t0 = time.perf_counter()

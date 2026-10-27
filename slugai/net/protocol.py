@@ -6,17 +6,18 @@ Frame layout (all integers big-endian):
 
 ``total_len`` counts everything after itself. The header is a JSON object with
 at least a ``type`` key. When a tensor rides along, the header also carries
-``dtype`` (numpy dtype string, usually ``float16``) and ``shape`` (list of ints),
-and the payload holds the array's C-contiguous bytes.
+``dtype`` (numpy dtype string: ``float16``/``float32`` hidden states,
+``uint16`` for bfloat16 bits, ``int32`` token ids) and ``shape`` (list of
+ints), and the payload holds the array's C-contiguous bytes.
 
 Message types (``type`` field):
 
 control (server <-> host)
-    hello, welcome, profile, profile_result, probe_link, probe_result,
-    load, loaded, start, feed, outputs, stats, pause, resume, drain, drained,
-    heartbeat, error, bye
+    hello/welcome, profile/profile_result, probe_link/probe_result,
+    load/loaded, start/started, feed, outputs, slot_free, stats,
+    pause/resume, unload/unloaded, ping/pong, heartbeat, error, bye
 data (host <-> host, around the ring)
-    peer_hello, hidden (carries a tensor), tokens, link_probe, link_probe_ack
+    peer_hello, hidden (carries a tensor), tokens, link_probe/link_probe_ack, bye
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ import numpy as np
 
 HEADER_STRUCT = struct.Struct("!II")
 MAX_FRAME = 1 << 31  # 2 GB; a sanity bound, not a design limit
-TENSOR_DTYPE = np.float16
 
 
 @dataclass

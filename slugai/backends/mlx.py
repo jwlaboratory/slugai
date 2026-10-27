@@ -40,8 +40,8 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.cache import BatchKVCache, make_prompt_cache
 from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
 
-from .backend import Backend, ModelInfo, Stage, Tokenizer
-from .placement import ModelSpec
+from ..placement import ModelSpec
+from .base import Backend, ModelInfo, Stage, Tokenizer
 
 log = logging.getLogger(__name__)
 

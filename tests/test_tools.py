@@ -6,10 +6,10 @@ import sys
 
 import pytest
 
-from slugai.backend import FakeBackend
-from slugai.bench import run_single, run_streaming
+from slugai.backends import FakeBackend
+from slugai.tools.bench import run_single, run_streaming
 from slugai.cli import build_parser, main as cli_main
-from tests.test_fake_backend import reference_generate
+from tests.helpers import reference_generate
 
 PROMPTS = ["the quick brown fox", "hi", "a much longer prompt than the others, indeed", "zebra", "x"]
 
@@ -61,3 +61,14 @@ def test_prep_model_local_dir(tmp_path, capsys):
     rc = cli_main(["prep-model", str(tmp_path)])
     assert rc == 0
     assert "1 shard" in capsys.readouterr().out
+
+
+def test_builtin_sample_prompts(tmp_path):
+    from slugai.prompts import load_prompts
+
+    sample = load_prompts()
+    assert len(sample) == 300 and all(isinstance(p, str) and p for p in sample)
+    assert load_prompts(limit=3) == sample[:3]
+    rep = tmp_path / "rep.json"  # no --prompts: the sample is used
+    rc = cli_main(["bench", "single", "--model", "fake-L4", "--backend", "fake", "--max-tokens", "3", "--limit", "4", "--report", str(rep)])
+    assert rc == 0 and json.loads(rep.read_text())["prompts"] == 4

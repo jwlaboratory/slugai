@@ -29,11 +29,11 @@ from typing import Optional
 
 import numpy as np
 
-from . import __version__
-from .backend import Backend, ModelInfo, Stage, Tokenizer, get_backend
-from .discovery import Advertiser
-from .protocol import Frame, pack
-from .transport import Connection, ConnectionClosed, connect, local_ip, serve
+from .. import __version__
+from ..backends import Backend, ModelInfo, Stage, Tokenizer, get_backend
+from ..net.discovery import Advertiser
+from ..net.protocol import Frame, pack
+from ..net.transport import Connection, ConnectionClosed, connect, local_ip, serve
 
 log = logging.getLogger(__name__)
 
@@ -560,7 +560,7 @@ def _caffeinate() -> Optional[subprocess.Popen]:
 
 
 async def main(args) -> int:
-    from .models import apply_models_dir
+    from ..models import apply_models_dir
 
     apply_models_dir(args.models_dir)
     backend = get_backend(args.backend)

@@ -23,9 +23,9 @@ from typing import Optional
 
 import numpy as np
 
-from .backend import Backend, ModelInfo, Stage
-from .models import apply_models_dir
-from .prompts import load_prompts
+from ..backends import Backend, ModelInfo, Stage
+from ..models import apply_models_dir
+from ..prompts import load_prompts
 
 log = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def run_streaming(backend: Backend, model: str, prompts: list[str], max_tokens: 
 
 def main(args) -> int:
     apply_models_dir(getattr(args, "models_dir", None))
-    from .backend import get_backend
+    from ..backends import get_backend
 
     backend = get_backend(args.backend)
     prompts = load_prompts(args.prompts, limit=args.limit)

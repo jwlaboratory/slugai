@@ -6,11 +6,11 @@ import json
 import numpy as np
 import pytest
 
-from slugai.backend import FakeBackend
-from slugai.discovery import HostAddr
-from slugai.host import HostDaemon
-from slugai.server import Server
-from tests.test_fake_backend import reference_generate
+from slugai.backends import FakeBackend
+from slugai.net.discovery import HostAddr
+from slugai.ring.host import HostDaemon
+from slugai.ring.server import Server
+from tests.helpers import reference_generate
 
 PROMPTS = [
     "the quick brown fox",
@@ -25,6 +25,11 @@ PROMPTS = [
     "The end.",
     "lorem ipsum dolor sit amet",
 ]
+
+
+def busiest(placement):
+    """The host holding the most layers: slowing it down always leaves layers to move."""
+    return max(zip(placement.order, placement.layers), key=lambda nl: nl[1][1] - nl[1][0])[0]
 
 
 async def start_hosts(n, backend_factory):
@@ -135,10 +140,10 @@ async def test_rebalance_moves_layers_when_a_host_slows(tmp_path):
         )
 
         async def slow_down_later():
-            # wait until decoding, then make whichever host is stage 1 slow and force a rebalance
+            # wait until decoding, then slow the host with the most layers (so some can move) and force a rebalance
             while server.state.phase != "decode":
                 await asyncio.sleep(0.05)
-            name = server.placement.order[0]
+            name = busiest(server.placement)
             d = next(h for h in hosts if h.name == name)
             d.stage.slow_ms = 100.0
             await asyncio.sleep(1.0)  # let stats reflect the slowdown
@@ -161,8 +166,8 @@ async def test_rebalance_moves_layers_when_a_host_slows(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dashboard_render_and_discovery(tmp_path):
-    from slugai.dashboard import render
-    from slugai.discovery import browse
+    from slugai.ring.dashboard import render
+    from slugai.net.discovery import browse
 
     hosts = await start_hosts(2, lambda i: FakeBackend(slow_ms=0, free_mem=1 << 30))
     try:
@@ -185,7 +190,7 @@ async def test_dashboard_render_and_discovery(tmp_path):
             await d.stop()
 
     # Bonjour: advertise one host and browse for it (skipped where multicast is unavailable)
-    from slugai.discovery import Advertiser
+    from slugai.net.discovery import Advertiser
 
     adv = Advertiser("zc-test-host", 12345, {"backend": "fake"}, ip="127.0.0.1")
     try:
@@ -203,7 +208,7 @@ async def test_dashboard_render_and_discovery(tmp_path):
 
 @pytest.mark.asyncio
 async def test_textual_dashboard_headless(tmp_path):
-    from slugai.dashboard import run_tui
+    from slugai.ring.dashboard import run_tui
 
     hosts = await start_hosts(2, lambda i: FakeBackend(slow_ms=0, free_mem=1 << 30))
     try:
@@ -225,7 +230,7 @@ async def test_long_profile_keeps_control_connection(tmp_path, monkeypatch):
     """A profile (or load) that outlasts the heartbeat timeout must not drop the server."""
     import time
 
-    import slugai.transport as transport
+    import slugai.net.transport as transport
 
     monkeypatch.setattr(transport, "HEARTBEAT_INTERVAL", 0.1)
     monkeypatch.setattr(transport, "HEARTBEAT_TIMEOUT", 0.5)
@@ -310,7 +315,7 @@ async def test_periodic_check_rebalances_once_when_a_host_throttles(tmp_path):
         async def throttle_later():
             while server.state.phase != "decode":
                 await asyncio.sleep(0.05)
-            name = server.placement.order[0]
+            name = busiest(server.placement)
             d = next(h for h in hosts if h.name == name)
             d.backend.slow_ms = d.stage.slow_ms = 100.0  # stays slow across reloads
             return name
@@ -338,7 +343,7 @@ async def test_ctrl_c_writes_partial_results(tmp_path):
     import os
     import signal
 
-    from slugai.dashboard import run_plain
+    from slugai.ring.dashboard import run_plain
 
     hosts = await start_hosts(2, lambda i: FakeBackend(slow_ms=5, free_mem=1 << 30))
     try:

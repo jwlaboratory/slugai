@@ -6,8 +6,8 @@ We only care about throughput, not latency. Three MacBooks with different
 compute and different network speeds hold a model too big for any one of them
 (target: Qwen3-Next-80B-A3B-Instruct, 4-bit, ~45 GB). Each Mac holds a
 contiguous block of layers and their KV cache; only hidden states cross the
-network (~16 KB per sequence per token); micro-batches circulate the ring so
-that communication overlaps compute.
+network (4 KB per sequence per token for Qwen3-Next's 2048-wide bf16 states);
+micro-batches circulate the ring so that communication overlaps compute.
 
 ```
            hidden states            hidden states
@@ -35,16 +35,17 @@ pip install slugai
 slugai run --model mlx-community/Qwen3-8B-4bit --prompts prompts.jsonl
 ```
 
-`slowring` is accepted as an alias of `slugai`. Hosts are found over Bonjour;
-`--hosts a:47111,b:47111,c:47111` skips discovery.
+Hosts are found over Bonjour; `--hosts a,b,c` (or `a:47111,b:47111,...`)
+skips discovery. Without `--prompts`, jobs use 300 built-in sample prompts —
+add `--limit N` for a quick try.
 
 ## Commands
 
 | command | what it does |
 | --- | --- |
 | `slugai host` | start on each MacBook; blocks sleep and waits for the server |
-| `slugai run --model M --prompts P` | start a job on the server |
-| `slugai bench single\|streaming --model M --prompts P` | run a baseline on the same prompts |
+| `slugai run --model M [--prompts P]` | start a job on the server |
+| `slugai bench single\|streaming --model M [--prompts P]` | run a baseline on the same prompts |
 | `slugai prep-model M` | stage model files on this Mac |
 | `slugai profile --model M` | profile one Mac (time per layer, memory) |
 | `slugai doctor [--model M]` | check a Mac's setup |
@@ -75,7 +76,9 @@ MacBook-C > MacBook-A  0.2 KB/s    9.0 MB/s   token ids
 [p] pause  [r] rebalance  [s] save report  [q] quit
 ```
 
-`--no-tui` prints the same numbers as log lines instead.
+`--no-tui` prints the same numbers as log lines instead. `[q]` (or Ctrl+Q, or
+Ctrl-C with `--no-tui`) stops the job and still writes the completions
+finished so far; a second Ctrl-C aborts without writing.
 
 ## How a job runs
 
@@ -88,52 +91,60 @@ by hand.
    cancel) and reports free memory. Every directed link is probed for latency
    (ping-pong) and bandwidth (4 MB transfers).
 2. **Place.** With `L_i` layers on Mac i, `t_i` its time per layer, `w` weight
-   bytes per layer, `k` KV bytes per layer per token, `B` sequences in flight,
-   `c` the context budget and `m_i` free memory:
+   bytes per layer, `k` KV bytes per layer per token, `s` fixed cache bytes per
+   layer per sequence (linear-attention state), `B` sequences in flight, `c`
+   the context budget (rounded up to the KV cache's 256-token blocks) and
+   `m_i` free memory:
 
        min over (L_1, L_2, L_3) of max_i L_i * t_i
-       s.t. L_i * (w + k * B * c) <= m_i,  sum_i L_i = L
+       s.t. L_i * (w + B * (k * c + s)) <= m_i,  sum_i L_i = L
 
    solved by dynamic programming for every ring order (the slowest link ends
-   up on the return hop, which only carries token ids). The micro-batch size
-   is the largest every link can keep up with; micro-batches are added until
-   no Mac idles or KV memory runs out.
+   up on the return hop, which only carries token ids). `k` and `s` are read
+   off the model's own caches, so hybrid models like Qwen3-Next (~2 MB of
+   state per linear-attention layer per sequence) are counted correctly. The
+   micro-batch size is the largest every link can keep up with, capped so even
+   a small job fills one micro-batch per Mac; micro-batches are added until no
+   Mac idles or memory runs out.
 3. **Load.** Each host loads just its layers (plus the embedding on stage 1,
    the final norm and lm_head on the last stage) and connects to the next host.
 4. **Prefill / decode.** The server feeds prompts into free slots; stage 1
    tokenizes and pads a micro-batch, the last stage picks the greedy token,
    streams finished sequences to the server and sends token ids back to
    stage 1. A slot is refilled as soon as all its sequences finish.
-5. **Rebalance.** Live per-stage step times double as continuous profiling.
-   If a Mac slows down (heat, throttling) and a re-solve predicts ≥10 % more
-   throughput, the server drains the slots at the next batch boundary,
-   reloads the stages with the new split and resumes. `[r]` forces a check.
+5. **Rebalance.** Live per-stage step times double as continuous profiling:
+   each Mac's profiled time per layer is scaled by measured / predicted for
+   its current layers. If a re-solve at those speeds predicts ≥10 % more
+   throughput than the current layout at the same speeds (a Mac slowed down
+   from heat or throttling, or was mis-profiled), the server drains the slots
+   at the next batch boundary, reloads the stages with the new split and
+   resumes. `[r]` forces a check and takes any faster layout.
 
 ## Layout
 
-| module | role |
+| path | role |
 | --- | --- |
-| `slugai/protocol.py` | length-prefixed frames: JSON header + optional fp16 tensor |
-| `slugai/transport.py` | asyncio connections, heartbeats |
-| `slugai/discovery.py` | Bonjour (zeroconf) advertise/browse |
+| `slugai/cli.py`, `__main__.py` | `slugai` command (also `python -m slugai`) |
 | `slugai/placement.py` | layer split, ring order, micro-batch choice, rebalance |
-| `slugai/backend.py` | `Stage`/`Backend` interface; numpy fake backend for tests |
-| `slugai/mlx_backend.py` | MLX backend built on mlx-lm's model classes and batch caches |
-| `slugai/host.py` | host daemon: profile, link probes, load layers, run a stage, stream stats |
-| `slugai/server.py` | coordinator: discover, profile, place, feed prompts, collect, rebalance |
-| `slugai/dashboard.py` | Textual dashboard / plain log fallback |
-| `slugai/bench.py` | baselines: `single` (one Mac, all layers) and `streaming` (FlexGen-style) |
-| `slugai/doctor.py`, `models.py`, `profiling.py` | setup checks, model staging, profiling CLI |
+| `slugai/prompts.py`, `data/` | prompt files; the built-in sample prompts |
+| `slugai/models.py` | model files on a host (`prep-model`, `--models-dir`) |
+| `slugai/net/` | `protocol` (frames: JSON header + optional tensor), `transport` (asyncio connections, heartbeats), `discovery` (Bonjour) |
+| `slugai/backends/` | `base` (`Stage`/`Backend` interface), `fake` (numpy toy model for tests), `mlx` (real models via mlx-lm) |
+| `slugai/ring/` | `host` (daemon: profile, link probes, load layers, run a stage), `server` (coordinator: discover → collect, rebalance), `dashboard` (Textual screen / plain logs) |
+| `slugai/tools/` | `bench` (`single` and FlexGen-style `streaming` baselines), `doctor`, `profiling` |
+| `tests/` | unit, end-to-end (fake backend, real sockets) and MLX tests; `helpers.py`, `tiny_model.py` |
 
 ### Wire protocol
 
 Frames are `u32 total_len | u32 header_len | JSON header | tensor bytes`. The
 header carries `type` and, for tensors, `dtype`/`shape`. Control messages
 (server ↔ host): `hello/welcome`, `profile/profile_result`,
-`probe_link/probe_result`, `load/loaded`, `start`, `feed`, `outputs`,
-`slot_free`, `stats`, `pause/resume`, `unload`, `heartbeat`, `error`, `bye`.
-Ring messages (host ↔ host): `peer_hello`, `hidden` (fp16 tensor, per slot),
-`tokens` (int32, last stage → stage 1), `link_probe/link_probe_ack`.
+`probe_link/probe_result`, `load/loaded`, `start/started`, `feed`,
+`outputs`, `slot_free`, `stats`, `pause/resume`, `unload/unloaded`,
+`ping/pong`, `heartbeat`, `error`, `bye`. Ring messages (host ↔ host):
+`peer_hello`, `hidden` (per slot, in the model's dtype; bf16 travels as its
+raw 16 bits), `tokens` (int32, last stage → stage 1),
+`link_probe/link_probe_ack`.
 
 ### MLX backend
 
@@ -143,7 +154,10 @@ stage's range and only those weights are evaluated. Middle stages swap the
 embedding and final norm for identities so hidden states flow straight
 through. KV caches are mlx-lm's batch caches (`BatchKVCache`, and
 `ArraysCache` for the linear-attention layers of hybrid models such as
-Qwen3-Next), which handle padding and per-sequence RoPE offsets.
+Qwen3-Next), which handle padding and per-sequence RoPE offsets. Hidden
+states stay in the model's dtype between Macs, so a ring produces exactly the
+tokens one Mac would. Needs mlx ≥ 0.32.3 and mlx-lm ≥ 0.32; older versions
+break the batch caches.
 
 ## Development
 
@@ -159,8 +173,23 @@ with real sockets. `slugai host --backend fake` runs the same thing by hand.
 
 The MLX backend has its own tests that build tiny Qwen3 (fp16 and 4-bit) and
 Qwen3-Next (linear attention + MoE) models on disk and check that the 3-stage
-ring reproduces mlx-lm's greedy tokens exactly. They run on Apple silicon, or
-on Linux with the CPU build: `pip install "mlx[cpu]" mlx-lm transformers`.
+ring reproduces mlx-lm's greedy tokens exactly. On Apple silicon install
+`-e ".[dev,mlx]" transformers`; on Linux use the CPU build:
+`pip install "mlx[cpu]" mlx-lm transformers`.
+
+To try a real ring on one Mac, start three hosts on different ports and point
+a job at them, then check the tokens against `bench single` with the same
+batch size:
+
+```
+for p in 47201 47202 47203; do slugai host --port $p --name mac$p --no-advertise & done
+slugai run --model mlx-community/Qwen3-8B-4bit --hosts 127.0.0.1:47201,127.0.0.1:47202,127.0.0.1:47203 \
+    --limit 120 --max-tokens 64 --micro-batch 32 --num-micro-batches 3 --no-tui
+slugai bench single --model mlx-community/Qwen3-8B-4bit --limit 120 --max-tokens 64 --batch 32
+```
+
+Each host reports the whole Mac's free memory, so pin the micro-batches as
+above: left to itself, placement would over-commit the shared memory.
 
 ## Prior work
 
