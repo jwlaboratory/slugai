@@ -15,11 +15,18 @@ With ``M`` micro-batches in flight the busiest resource is never idle once
 ``M * bottleneck >= lap``, where ``lap`` is one micro-batch's full trip around
 the ring. Throughput is then ``b * M / max(M * bottleneck, lap)`` tokens/s.
 
-Memory: stage i must hold its weights plus KV cache for every sequence in
-flight: ``L_i * (w + B * (k * c + s)) <= m_i`` with ``B = b * M`` sequences,
-context ``c`` (rounded up to the cache's allocation block) and ``s`` bytes of
-fixed per-sequence state (linear-attention layers). Stage 1 also holds the
-embedding table, the last stage the final norm and lm_head.
+Memory: stage i must hold KV cache for every sequence in flight,
+``L_i * B * (k * c + s)`` with ``B = b * M`` sequences, context ``c`` (rounded
+up to the cache's allocation block) and ``s`` bytes of fixed per-sequence
+state (linear-attention layers), plus its layers' weights ``w`` each. Stage 1
+also holds the embedding table, the last stage the final norm and lm_head.
+
+Streaming (FlexGen-style): when a Mac's layers don't all fit, it keeps
+``R_i`` of them in memory and *streams* the rest, reading each from disk for
+every micro-batch through one layer's worth of spare room:
+``R_i * w + w + L_i * B * (k * c + s) <= m_i``, and the stage's time grows by
+``(L_i - R_i) * w / disk_bw_i``. That lets the ring run a model bigger than
+all its memory, slowly; the split minimises the slowest stage either way.
 """
 
 from __future__ import annotations
@@ -62,6 +69,7 @@ class HostProfile:
     free_mem: int  # bytes usable for weights + KV
     # micro-batch size -> seconds per layer per decode step
     layer_time: dict[int, float]
+    disk_bw: float = 0.0  # bytes/s reading model files; 0: can't stream layers
 
     def time_per_layer(self, b: int) -> float:
         """Linear interpolation (and extrapolation) of the profiled points."""
@@ -98,12 +106,13 @@ class LinkProfile:
 class Placement:
     order: list[str]  # host names in ring order
     layers: list[tuple[int, int]]  # [start, end) per stage
+    resident: list[int]  # layers per stage kept in memory; the rest stream from disk
     micro_batch: int
     num_micro_batches: int
     step_time: float  # predicted seconds per decode round (all micro-batches once)
     predicted_tok_s: float
     peak_tok_s: float  # if links were free and no bubbles
-    stage_compute: list[float]  # seconds per micro-batch per stage
+    stage_compute: list[float]  # seconds per micro-batch per stage (incl. reading streamed layers)
     link_times: list[float]  # seconds per micro-batch per hop (last = return hop)
     context: int
 
@@ -124,37 +133,32 @@ class PlacementError(RuntimeError):
 # --------------------------------------------------------------------------- split
 
 
-def best_split(times: list[float], caps: list[int], num_layers: int) -> Optional[tuple[list[int], float]]:
-    """Contiguous split of ``num_layers`` over stages minimising ``max_i L_i * t_i``.
+INF = float("inf")
 
-    ``caps[i]`` is the most layers stage i can hold. Every stage gets at least
-    one layer. Returns (layers per stage, bottleneck seconds) or None if the
-    caps cannot hold the model. Dynamic programme over (stage, layers so far),
-    O(S * L^2); for 3 stages and 80 layers this is a few thousand steps.
+
+def best_split(costs: list[list[float]], num_layers: int) -> Optional[tuple[list[int], float]]:
+    """Contiguous split of ``num_layers`` over stages minimising the slowest stage.
+
+    ``costs[s][l]`` is stage s's seconds per micro-batch with ``l`` layers
+    (inf if it can't hold them). Every stage gets at least one layer. Returns
+    (layers per stage, bottleneck seconds) or None if no split fits. Dynamic
+    programme over (stage, layers so far), O(S * L^2); for 3 stages and 80
+    layers this is a few thousand steps.
     """
-    S = len(times)
-    if S == 0 or sum(caps) < num_layers or any(c < 1 for c in caps):
+    S = len(costs)
+    if S == 0:
         return None
-    INF = float("inf")
     # dp[s][n] = min bottleneck using first s stages for exactly n layers
     dp = [[INF] * (num_layers + 1) for _ in range(S + 1)]
     choice = [[0] * (num_layers + 1) for _ in range(S + 1)]
     dp[0][0] = 0.0
     for s in range(1, S + 1):
-        t = times[s - 1]
-        cap = caps[s - 1]
+        c = costs[s - 1]
         for n in range(1, num_layers + 1):
-            best = INF
-            best_l = 0
-            for l in range(1, min(cap, n) + 1):
-                prev = dp[s - 1][n - l]
-                if prev == INF:
-                    continue
-                cost = max(prev, l * t)
-                if cost < best:
-                    best, best_l = cost, l
-            dp[s][n] = best
-            choice[s][n] = best_l
+            for l in range(1, n + 1):
+                cost = max(dp[s - 1][n - l], c[l])
+                if cost < dp[s][n]:
+                    dp[s][n], choice[s][n] = cost, l
     if dp[S][num_layers] == INF:
         return None
     out = []
@@ -165,6 +169,33 @@ def best_split(times: list[float], caps: list[int], num_layers: int) -> Optional
         n -= l
     out.reverse()
     return out, dp[S][num_layers]
+
+
+def _stage_costs(spec: ModelSpec, host: HostProfile, b: int, B: int, context: int, extra: int) -> tuple[list[float], list[int]]:
+    """For 0..L layers on ``host``: seconds per micro-batch (inf: can't fit) and how many stay in memory.
+
+    Layers that don't fit next to the caches are streamed: kept on disk and
+    read for every micro-batch, through one layer's worth of spare room.
+    """
+    L, w = spec.num_layers, spec.layer_bytes
+    t = host.time_per_layer(b)
+    read = w / host.disk_bw if host.disk_bw > 0 else INF
+    cache = B * spec.cache_bytes_per_seq(context)
+    cost, keep = [INF] * (L + 1), [0] * (L + 1)
+    for l in range(1, L + 1):
+        room = host.free_mem - extra - l * cache
+        if room >= l * w:
+            cost[l], keep[l] = l * t, l
+        elif read < INF and room >= w:
+            r = int(room // w) - 1
+            cost[l], keep[l] = l * t + (l - r) * read, r
+    return cost, keep
+
+
+def _stage_time(spec: ModelSpec, host: HostProfile, b: int, layers: int, resident: int) -> float:
+    """Seconds per micro-batch for ``layers`` layers on ``host``, ``resident`` of them in memory."""
+    streamed = layers - resident
+    return layers * host.time_per_layer(b) + (streamed * spec.layer_bytes / host.disk_bw if streamed > 0 else 0.0)
 
 
 # --------------------------------------------------------------------------- solve
@@ -187,19 +218,15 @@ def evaluate(
     context: int,
 ) -> Optional[Placement]:
     """Best placement for a fixed ring order, micro-batch size and count; None if it doesn't fit."""
-    S = len(order)
-    B = b * M
-    per_layer = spec.layer_bytes + B * spec.cache_bytes_per_seq(context)
-    extras = _extras_for_order(spec, S)
-    caps = []
-    for i, name in enumerate(order):
-        avail = hosts[name].free_mem - extras[i]
-        caps.append(max(0, int(avail // per_layer)))
-    times = [hosts[name].time_per_layer(b) for name in order]
-    sp = best_split(times, caps, spec.num_layers)
+    extras = _extras_for_order(spec, len(order))
+    tables = [_stage_costs(spec, hosts[name], b, b * M, context, extras[i]) for i, name in enumerate(order)]
+    sp = best_split([cost for cost, _ in tables], spec.num_layers)
     if sp is None:
         return None
-    return _assemble(spec, links, order, sp[0], times, b, M, context)
+    layers_n = sp[0]
+    compute = [tables[i][0][l] for i, l in enumerate(layers_n)]
+    resident = [tables[i][1][l] for i, l in enumerate(layers_n)]
+    return _assemble(spec, links, order, layers_n, compute, resident, b, M, context)
 
 
 def _assemble(
@@ -207,14 +234,14 @@ def _assemble(
     links: dict[tuple[str, str], LinkProfile],
     order: list[str],
     layers_n: list[int],
-    times: list[float],
+    compute: list[float],
+    resident: list[int],
     b: int,
     M: int,
     context: int,
 ) -> Optional[Placement]:
-    """Predicted timings and throughput for a fixed ring order and layer counts."""
+    """Predicted timings and throughput for a fixed ring order, layer counts and stage times."""
     S = len(order)
-    compute = [l * t for l, t in zip(layers_n, times)]
     hops = []
     for i in range(S):
         src, dst = order[i], order[(i + 1) % S]
@@ -238,6 +265,7 @@ def _assemble(
     return Placement(
         order=list(order),
         layers=bounds,
+        resident=list(resident),
         micro_batch=b,
         num_micro_batches=M,
         step_time=step,
@@ -257,9 +285,9 @@ def predict(
 ) -> Placement:
     """``current``'s layout (order, layers, micro-batches) re-predicted with other host timings."""
     b, M = current.micro_batch, current.num_micro_batches
-    times = [hosts[name].time_per_layer(b) for name in current.order]
     layers_n = [e - a for a, e in current.layers]
-    p = _assemble(spec, links, current.order, layers_n, times, b, M, current.context)
+    compute = [_stage_time(spec, hosts[n], b, l, r) for n, l, r in zip(current.order, layers_n, current.resident)]
+    p = _assemble(spec, links, current.order, layers_n, compute, current.resident, b, M, current.context)
     if p is None:
         raise PlacementError("no link profile for the current ring")
     return p
@@ -322,9 +350,10 @@ def solve(
     if best is None:
         need = spec.num_layers * spec.layer_bytes + spec.embed_bytes + spec.head_bytes
         have = sum(h.free_mem for h in hosts.values())
+        why = "not even streaming layers from disk leaves room for the caches" if any(h.disk_bw > 0 for h in hosts.values()) else "and the hosts can't stream layers from disk"
         raise PlacementError(
-            f"model does not fit: needs >= {need / 1e9:.1f} GB of weights across hosts, "
-            f"hosts have {have / 1e9:.1f} GB free in total (context {context})"
+            f"model does not fit: {need / 1e9:.1f} GB of weights, hosts have {have / 1e9:.1f} GB free in total, "
+            f"{why} (context {context})"
         )
     return best
 
@@ -356,10 +385,10 @@ def rebalance_with_measurements(
     """Fold live per-stage step times back into the host profiles and re-solve.
 
     ``measured_step[host]`` is the observed seconds per micro-batch on that host.
-    We scale that host's profiled time-per-layer by observed / what the profile
-    predicts for its current layers, so a Mac that is throttling gets fewer
-    layers. ``hosts`` are always the original profiles, so the scale stays
-    right after earlier rebalances.
+    We scale that host's profile (compute and disk reads alike) by observed /
+    what the profile predicts for its current layers, so a Mac that is
+    throttling gets fewer layers. ``hosts`` are always the original profiles,
+    so the scale stays right after earlier rebalances.
 
     Returns ``(now, proposed)``: the current layout re-predicted with the
     measured speeds, and the best layout for them; compare the two with
@@ -370,14 +399,16 @@ def rebalance_with_measurements(
     for name, h in hosts.items():
         scale = 1.0
         if name in measured_step and name in current.order:
-            a, e = current.layers[current.order.index(name)]
-            predicted = (e - a) * h.time_per_layer(b)
+            i = current.order.index(name)
+            a, e = current.layers[i]
+            predicted = _stage_time(spec, h, b, e - a, current.resident[i])
             if predicted > 0 and measured_step[name] > 0:
                 scale = measured_step[name] / predicted
         hosts2[name] = HostProfile(
             name=h.name,
             free_mem=h.free_mem,
             layer_time={k: v * scale for k, v in h.layer_time.items()},
+            disk_bw=h.disk_bw / scale,
         )
     now = predict(current, spec, hosts2, links)
     proposed = solve(

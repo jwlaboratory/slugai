@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("host", help="run the host daemon on this MacBook")
     h.add_argument("--port", type=int, default=DEFAULT_PORT)
     h.add_argument("--name", default=None, help="host name advertised to the server (default: hostname)")
+    h.add_argument("--max-memory", type=float, default=None, metavar="GB", help="use at most this much memory for weights and caches; layers that don't fit stream from disk (default: what macOS allows the GPU)")
     h.add_argument("--no-caffeinate", action="store_true", help="do not block sleep")
     h.add_argument("--no-advertise", action="store_true", help="do not advertise over Bonjour")
 

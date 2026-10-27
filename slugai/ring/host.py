@@ -246,6 +246,7 @@ class HostDaemon:
             "profile_result",
             layer_time={str(k): v for k, v in prof["layer_time"].items()},
             free_mem=prof["free_mem"],
+            disk_bw=prof["disk_bw"],
             total_mem=self.backend.total_memory(),
             spec=info.spec.__dict__,
         )
@@ -290,7 +291,8 @@ class HostDaemon:
         log.info("loading %s layers %d-%d (stage %d/%d)", model, a, b - 1, stage_idx + 1, num_stages)
         loop = asyncio.get_running_loop()
         t0 = time.perf_counter()
-        self.stage = await loop.run_in_executor(self.executor, lambda: self.backend.load_stage(model, (a, b), first, last))
+        resident = f.get("resident")
+        self.stage = await loop.run_in_executor(self.executor, lambda: self.backend.load_stage(model, (a, b), first, last, resident=resident))
         self.tok = self.backend.tokenizer(model)
         self.info = self.backend.model_info(model)
         load_s = time.perf_counter() - t0
@@ -527,7 +529,7 @@ def _caffeinate() -> Optional[subprocess.Popen]:
 
 
 async def main(args) -> int:
-    backend = Backend()
+    backend = Backend(memory_limit=int(args.max_memory * 1e9) if args.max_memory else None)
     name = args.name or socket.gethostname().split(".")[0]
     daemon = HostDaemon(name, args.port, backend, advertise=not args.no_advertise)
     caff = None if args.no_caffeinate else _caffeinate()

@@ -287,3 +287,31 @@ async def test_ctrl_c_writes_partial_results(tiny, tmp_path):
         assert len(recs) == len(PROMPTS) * 6 and 2 <= len(done) < len(recs)
     finally:
         await stop_all(hosts)
+
+
+@pytest.mark.asyncio
+async def test_ring_streams_layers_that_do_not_fit(tiny, tmp_path):
+    """Hosts too small for the model stream the rest of their layers from disk, with identical output."""
+    spec = Backend(use_chat_template=False).model_info(str(tiny)).spec
+    # room for half the layers' caches (8 sequences, one 256-token block), the embedding and head,
+    # and 2.5 layers of weights: one resident, one to stream through
+    room = spec.embed_bytes + spec.head_bytes + spec.num_layers // 2 * 8 * spec.cache_bytes_per_seq(1) + int(2.5 * spec.layer_bytes)
+
+    class SmallMemory(Backend):
+        def free_memory(self):
+            return room
+
+    hosts = await start_hosts(2, lambda i: SmallMemory(use_chat_template=False))
+    try:
+        server = Server(
+            model=str(tiny), prompts=PROMPTS, job="tstream", hosts=addrs(hosts), min_hosts=2, max_tokens=6,
+            micro_batch=4, num_micro_batches=2, rebalance=False, output_path=str(tmp_path / "o.jsonl"),
+            profile_batch_sizes=(1, 4),
+        )
+        report = await asyncio.wait_for(server.run(), 60)
+        assert server.state.error is None and report["sequences_done"] == len(PROMPTS)
+        p = report["placement"]
+        assert sum(b - a for a, b in p["layers"]) - sum(p["resident"]) >= 3  # most layers stream
+        assert [r["token_ids"] for r in records(tmp_path / "o.jsonl")] == one_machine(tiny, PROMPTS, 6, batch=4)
+    finally:
+        await stop_all(hosts)

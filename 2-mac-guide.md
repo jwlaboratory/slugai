@@ -5,7 +5,8 @@ micro-batches circulate between the two so both stay busy. What we measure is
 throughput, the total tokens per second across all prompts.
 
 Start with Qwen3-8B. It fits on one Mac, so you can compare the pair against a
-single Mac. Then try the 80B model if your two Macs have enough memory.
+single Mac. Then try the 80B model: if it doesn't fit in the two Macs' memory,
+the layers that don't fit stream from disk.
 
 ## What you need
 
@@ -111,12 +112,16 @@ get in the table at the end.
 
 ## 6. The 80B model (optional)
 
-This only fits if the two "recommended working set" numbers from step 2 add up
-to well over 45 GB, leaving room for caches on top of the weights. For example,
-a 36 GB and a 48 GB MacBook (about 27 + 36 GB) work; two 24 GB MacBooks (about
-18 + 18 GB) don't. If they can't hold it, the planner stops with
-"model does not fit". Close other apps first, since the planner counts the GPU
-memory limit, not what other apps are using.
+If the two "recommended working set" numbers from step 2 add up to well over
+45 GB (for example a 36 GB and a 48 GB MacBook, about 27 + 36 GB), the model
+fits in memory. If not, slugai streams the layers that don't fit: they stay on
+disk and are read for every step, FlexGen-style. The `placement:` line shows
+how many, e.g. `pro:0-32 (32 from disk)`. It runs, but slowly, because reading
+weights from disk every step costs far more than keeping them. On a MacBook Pro
+(19 GB) plus a MacBook Air (12.7 GB) the planner predicts roughly 15-30 tok/s,
+depending on how fast each disk reads; a fast SSD matters more than anything
+else. Close other apps first, since the planner counts the GPU memory limit,
+not what other apps are using.
 
 On both Macs (about 45 GB each; the hosts can keep running):
 

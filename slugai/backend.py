@@ -25,7 +25,10 @@ here without per-model code:
   instead of keys and values;
 * hidden states cross the wire in the model's own dtype (bfloat16 as its raw
   16 bits, since numpy has no bfloat16), so the ring computes exactly what one
-  machine would and large activations never overflow float16.
+  machine would and large activations never overflow float16;
+* a stage may *stream* some of its layers, FlexGen-style: their weights stay
+  on disk and are read just before each use, then dropped, so a Mac can run
+  more layers than fit in its memory (at the cost of reading them every step).
 
 Prompts are right-padded for prefill, exactly as mlx-lm's batch generator
 does, and ``pad_lens[i]`` says how many pad tokens sequence ``i`` has; the
@@ -37,7 +40,9 @@ so that, after prefill, all sequences in a micro-batch are aligned.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -48,7 +53,7 @@ import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 from mlx_lm.models.cache import BatchKVCache, make_prompt_cache
 from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
 
@@ -147,6 +152,67 @@ def _set_layers(inner, layers: list) -> None:
         inner.fa_idx = next((i for i, l in enumerate(layers) if not getattr(l, "is_linear", False)), None)
 
 
+def _weight_files(path: Path) -> dict[str, Path]:
+    """Which safetensors file holds each weight (from the index, or each file's header)."""
+    index = path / "model.safetensors.index.json"
+    if index.exists():
+        return {k: path / f for k, f in json.loads(index.read_text())["weight_map"].items()}
+    return {k: f for f in sorted(path.glob("model*.safetensors")) for k in mx.load(str(f))}  # lazy: headers only
+
+
+def _stream(model, layer, index: int, files: dict[str, Path]) -> None:
+    """Make ``layer`` (global number ``index``) read its weights from disk for each call and drop them after."""
+    prefix = f"model.layers.{index}."
+    owning = sorted({f for k, f in files.items() if k.startswith(prefix)})
+
+    def load() -> dict:  # the layer's weights as unread arrays: mx.load only parses headers
+        w = {k: v for f in owning for k, v in mx.load(str(f)).items() if k.startswith(prefix)}
+        if hasattr(model, "sanitize"):
+            w = model.sanitize(w)
+        return tree_unflatten([(k[len(prefix):], v) for k, v in w.items() if k.startswith(prefix)])
+
+    want = {k: v.shape for k, v in tree_flatten(layer.parameters())}
+    have = {k: v.shape for k, v in tree_flatten(load())}
+    if want != have:
+        raise ValueError(f"can't stream layer {index}: its weights on disk don't match the model ({sorted(set(want) ^ set(have))[:3]})")
+    base = type(layer)
+
+    def __call__(self, *args, **kwargs):
+        self.update(load())
+        out = base.__call__(self, *args, **kwargs)
+        cache = kwargs.get("cache", args[2] if len(args) > 2 else None)
+        mx.eval(out, cache.state if cache is not None else [])  # finish with the weights...
+        self.update(load())  # ...then swap in unread ones, freeing these
+        return out
+
+    layer.__class__ = type(f"Streamed{base.__name__}", (base,), {"__call__": __call__})
+    layer.update(load())
+
+
+def _disk_read_speed(files: list[Path], nbytes: int = 1 << 30) -> float:
+    """Bytes/s reading the model's files, bypassing the file cache where macOS allows (F_NOCACHE)."""
+    import fcntl
+
+    done, t0 = 0, time.perf_counter()
+    for f in files:
+        fd = os.open(f, os.O_RDONLY)
+        try:
+            try:
+                fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)
+            except OSError:
+                pass
+            while done < nbytes:
+                chunk = os.read(fd, 16 << 20)
+                if not chunk:
+                    break
+                done += len(chunk)
+        finally:
+            os.close(fd)
+        if done >= nbytes:
+            break
+    return done / max(time.perf_counter() - t0, 1e-6)
+
+
 class _Identity(nn.Module):
     def __call__(self, x):
         return x
@@ -177,10 +243,11 @@ class Tokenizer:
 class Stage:
     """A loaded range of layers with per-slot KV caches."""
 
-    def __init__(self, model, first: bool, last: bool):
+    def __init__(self, model, first: bool, last: bool, streamed: int = 0):
         self.model = model
         self.inner = model.model
         self.first, self.last = first, last
+        self.streamed = streamed  # layers read from disk at every step
         self.caches: dict[int, list] = {}
         self.tie = bool(getattr(model.args, "tie_word_embeddings", False))
         self.supports_input_embeddings = "input_embeddings" in inspect.signature(self.inner.__call__).parameters
@@ -262,10 +329,15 @@ class Stage:
 
 
 class Backend:
-    """Loads models: their sizes, tokenizer, a stage of layers, and this Mac's memory and speed."""
+    """Loads models: their sizes, tokenizer, a stage of layers, and this Mac's memory and speed.
 
-    def __init__(self, use_chat_template: bool = True):
+    ``memory_limit`` caps the bytes this Mac offers for weights and caches
+    (default: what macOS recommends for the GPU).
+    """
+
+    def __init__(self, use_chat_template: bool = True, memory_limit: Optional[int] = None):
         self.use_chat_template = use_chat_template
+        self.memory_limit = memory_limit
         self._paths: dict[str, Path] = {}
         self._configs: dict[str, dict] = {}
         self._tokenizers: dict[str, Tokenizer] = {}
@@ -349,24 +421,34 @@ class Backend:
     # -------------------------------------------------------------- memory
 
     def total_memory(self) -> int:
-        return _recommended_memory()
+        rec = _recommended_memory()
+        return min(rec, self.memory_limit) if self.memory_limit else rec
 
     def free_memory(self) -> int:
         """Bytes this Mac can give to weights + KV cache right now."""
-        return max(0, _recommended_memory() - _active_memory() - (1 << 30))
+        total = self.total_memory()
+        return max(0, total - _active_memory() - min(1 << 30, total // 10))
 
     # -------------------------------------------------------------- stage
 
-    def load_stage(self, model_id: str, layer_range: tuple[int, int], first: bool, last: bool) -> Stage:
+    def load_stage(self, model_id: str, layer_range: tuple[int, int], first: bool, last: bool, resident: Optional[int] = None) -> Stage:
+        """Load layers ``[a, b)``. The first ``resident`` stay in memory (default: all);
+        the rest are streamed from disk at every step."""
         a, b = layer_range
-        model, _ = load_model(self.model_path(model_id), lazy=True, strict=False)
+        path = self.model_path(model_id)
+        model, _ = load_model(path, lazy=True, strict=False)
         inner = model.model
         all_layers = list(inner.layers)
         if not (0 <= a < b <= len(all_layers)):
             raise ValueError(f"layer range {layer_range} outside 0..{len(all_layers)}")
         _set_layers(inner, all_layers[a:b])
+        keep = b - a if resident is None else max(0, min(resident, b - a))
+        if keep < b - a:
+            files = _weight_files(path)
+            for j in range(keep, b - a):
+                _stream(model, inner.layers[j], a + j, files)
         tie = bool(getattr(model.args, "tie_word_embeddings", False))
-        to_eval = [l.parameters() for l in inner.layers]
+        to_eval = [l.parameters() for l in inner.layers[:keep]]
         if first or (last and tie):
             to_eval.append(inner.embed_tokens.parameters())
         if not first and "input_embeddings" not in inspect.signature(inner.__call__).parameters:
@@ -385,8 +467,11 @@ class Backend:
         t0 = time.perf_counter()
         mx.eval(to_eval)
         mx.clear_cache()
-        log.info("stage %s layers %d-%d loaded in %.1fs, active memory %.2f GB", model_id, a, b - 1, time.perf_counter() - t0, _active_memory() / 1e9)
-        return Stage(model, first, last)
+        log.info(
+            "stage %s layers %d-%d loaded in %.1fs (%d streamed from disk), active memory %.2f GB",
+            model_id, a, b - 1, time.perf_counter() - t0, b - a - keep, _active_memory() / 1e9,
+        )
+        return Stage(model, first, last, streamed=b - a - keep)
 
     # -------------------------------------------------------------- profile
 
@@ -400,8 +485,9 @@ class Backend:
         more; inputs are random tokens so MoE layers route to a realistic mix
         of experts. After a GPU warm-up, each measurement drops two steps and
         takes the median of ``reps``, and the results are smoothed so time per
-        layer never falls as the batch grows. Returns
-        ``{"layer_time": {b: seconds}, "free_mem": bytes}``.
+        layer never falls as the batch grows. Also measures how fast the
+        model's files read from disk (for streamed layers). Returns
+        ``{"layer_time": {b: seconds}, "disk_bw": bytes/s, "free_mem": bytes}``.
         """
         info = self.model_info(model_id)
         cfg = self.config(model_id)
@@ -461,4 +547,6 @@ class Backend:
         finally:
             _set_layers(stage.inner, full_layers)
             stage.unload()
-        return {"layer_time": layer_time, "free_mem": self.free_memory()}
+        disk_bw = _disk_read_speed(sorted(set(_weight_files(self.model_path(model_id)).values())))
+        log.info("disk reads at %.1f GB/s", disk_bw / 1e9)
+        return {"layer_time": layer_time, "disk_bw": disk_bw, "free_mem": self.free_memory()}

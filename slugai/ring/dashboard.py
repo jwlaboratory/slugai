@@ -67,10 +67,11 @@ def render(server: "Server") -> str:
         stage = h.get("stage")
         layers = h.get("layers")
         layers_s = f"{layers[0]}-{layers[1] - 1}" if layers else "-"
+        disk = f"  {h['streamed']} layers from disk" if h.get("streamed") else ""
         busy = f"{h.get('busy', 0.0) * 100:3.0f}%"
         step = f"{h.get('step', 0.0):.2f} s" if h.get("step") else "-"
         mem = f"{_gb(h.get('mem_used', 0))}/{_gb(h.get('mem_total', 0))} GB" if h.get("mem_total") else "-"
-        lines.append(f"{name:<{name_w}}  {str(stage + 1) if stage is not None else '-':<5}  {layers_s:<8} {busy:>4}  {step:<9} {mem}")
+        lines.append(f"{name:<{name_w}}  {str(stage + 1) if stage is not None else '-':<5}  {layers_s:<8} {busy:>4}  {step:<9} {mem}{disk}")
     lines.append("")
     if st.links:
         lw = max(7, max(len(f"{l['src']} > {l['dst']}") for l in st.links))

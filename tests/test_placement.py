@@ -10,6 +10,11 @@ from slugai.placement import (
 GB = 1 << 30
 
 
+def costs(times, caps, L):
+    """Resident-only stage cost tables: l layers take l * t seconds, up to the cap."""
+    return [[l * t if l <= cap else float("inf") for l in range(L + 1)] for t, cap in zip(times, caps)]
+
+
 def spec_70b():
     # 70B-class dense, 4-bit: ~0.5 GB/layer, hidden 8192, KV = 2*8*128*2 bytes = 4 KB/layer/token (GQA)
     return ModelSpec(num_layers=80, hidden_size=8192, layer_bytes=int(0.5 * GB), kv_bytes_per_token=4 * 1024,
@@ -37,20 +42,20 @@ def links_abc(slow=("B", "A")):
 
 
 def test_best_split_equal_hosts():
-    layers, bottleneck = best_split([1.0, 1.0, 1.0], [80, 80, 80], 80)
+    layers, bottleneck = best_split(costs([1.0, 1.0, 1.0], [80, 80, 80], 80), 80)
     assert sum(layers) == 80 and max(layers) - min(layers) <= 1
     assert bottleneck == 27.0
 
 
 def test_best_split_respects_caps_and_speed():
-    layers, bottleneck = best_split([1.0, 2.0, 1.0], [40, 40, 10], 80)
+    layers, bottleneck = best_split(costs([1.0, 2.0, 1.0], [40, 40, 10], 80), 80)
     assert sum(layers) == 80
     assert layers[2] <= 10
     assert layers[1] < layers[0]  # slower host gets fewer layers
 
 
 def test_best_split_infeasible():
-    assert best_split([1.0, 1.0], [10, 10], 80) is None
+    assert best_split(costs([1.0, 1.0], [10, 10], 80), 80) is None
 
 
 def test_solve_doc_example():
@@ -159,3 +164,60 @@ def test_single_host_degenerate():
     hosts = {"A": HostProfile("A", 10**9, {1: 0.001, 64: 0.002})}
     p = solve(spec, hosts, {("A", "A"): LinkProfile("A", "A", 1e9, 0.0)}, context=64)
     assert p.layers == [(0, 4)]
+
+
+def test_streams_a_model_bigger_than_all_memory():
+    """Like Qwen3-Next 80B (45 GB) on a 19 GB MacBook Pro and a 12.7 GB MacBook Air."""
+    spec = ModelSpec(num_layers=48, hidden_size=2048, layer_bytes=int(0.92e9), kv_bytes_per_token=512,
+                     embed_bytes=int(0.3e9), head_bytes=int(0.3e9), state_bytes_per_seq=int(1.65e6), kv_block_tokens=256)
+    hosts = {
+        "pro": HostProfile("pro", int(17.3e9), {1: 0.004, 64: 0.012}, disk_bw=5e9),
+        "air": HostProfile("air", int(11e9), {1: 0.008, 64: 0.024}, disk_bw=2e9),
+    }
+    links = {(a, b): LinkProfile(a, b, 20e6, 0.004) for a in hosts for b in hosts if a != b}
+    with pytest.raises(PlacementError):  # without streaming it can't run
+        solve(spec, {n: HostProfile(n, h.free_mem, h.layer_time) for n, h in hosts.items()}, links, context=300)
+    p = solve(spec, hosts, links, context=300)
+    assert p.layers[0][0] == 0 and p.layers[-1][1] == 48
+    streamed = {n: (e - a) - r for n, (a, e), r in zip(p.order, p.layers, p.resident)}
+    assert sum(streamed.values()) > 0
+    B = p.sequences_in_flight
+    for i, name in enumerate(p.order):
+        a, e = p.layers[i]
+        extra = (spec.embed_bytes if i == 0 else 0) + (spec.head_bytes if i == len(p.order) - 1 else 0)
+        buffer = spec.layer_bytes if streamed[name] else 0
+        used = p.resident[i] * spec.layer_bytes + buffer + (e - a) * B * spec.cache_bytes_per_seq(300) + extra
+        assert used <= hosts[name].free_mem
+    # the stage times include reading the streamed layers from disk
+    i = p.order.index("pro")
+    assert p.stage_compute[i] >= streamed["pro"] * spec.layer_bytes / 5e9
+
+
+def test_no_streaming_when_the_model_fits():
+    spec, hosts, links = spec_70b(), hosts_abc(), links_abc()
+    for h in hosts.values():
+        h.disk_bw = 3e9
+    p = solve(spec, hosts, links, context=512)
+    assert p.resident == [e - a for a, e in p.layers]
+
+
+def test_streaming_goes_to_the_faster_disk():
+    spec = ModelSpec(num_layers=40, hidden_size=4096, layer_bytes=GB, kv_bytes_per_token=1024)
+    prof = {1: 0.01, 64: 0.02}
+    hosts = {"fast": HostProfile("fast", 12 * GB, dict(prof), disk_bw=6e9), "slow": HostProfile("slow", 12 * GB, dict(prof), disk_bw=1e9)}
+    links = {(a, b): LinkProfile(a, b, 50e6, 0.003) for a in hosts for b in hosts if a != b}
+    p = solve(spec, hosts, links, context=256)
+    streamed = {n: (e - a) - r for n, (a, e), r in zip(p.order, p.layers, p.resident)}
+    assert streamed["fast"] > streamed["slow"]
+
+
+def test_rebalance_scales_disk_time_too():
+    """A streaming layout measured exactly as predicted is left alone."""
+    spec = ModelSpec(num_layers=40, hidden_size=4096, layer_bytes=GB, kv_bytes_per_token=1024)
+    hosts = {n: HostProfile(n, 12 * GB, {1: 0.01, 64: 0.02}, disk_bw=3e9) for n in "AB"}
+    links = {(a, b): LinkProfile(a, b, 50e6, 0.003) for a in hosts for b in hosts if a != b}
+    p = solve(spec, hosts, links, context=256)
+    assert sum(p.resident) < 40
+    now, q = rebalance_with_measurements(p, spec, hosts, links, {n: p.stage_compute[i] for i, n in enumerate(p.order)})
+    assert now.predicted_tok_s == pytest.approx(p.predicted_tok_s)
+    assert not should_rebalance(now, q)

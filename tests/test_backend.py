@@ -84,3 +84,21 @@ def test_bench_matches_mlx_lm(tiny_model):
     single, stats = run_single(Backend(use_chat_template=False), str(tiny_model), PROMPTS, max_tokens=6, batch=4)
     assert [[t for t in g if t != 2] for g in single] == ref
     assert stats["tokens_generated"] == sum(len(g) for g in single)
+
+
+def test_streamed_layers_match_resident(tiny_model):
+    """Layers streamed from disk at every step compute exactly what resident layers do."""
+    be = Backend(use_chat_template=False)
+    L = be.model_info(str(tiny_model)).spec.num_layers
+    x = np.array([[1, 5, 6, 7], [1, 5, 0, 0]], dtype=np.int32)  # right padded
+    outs = []
+    for resident in (None, 1):  # all in memory, then all but one streamed
+        stage = be.load_stage(str(tiny_model), (0, L), first=True, last=True, resident=resident)
+        assert stage.streamed == (0 if resident is None else L - 1)
+        t = stage.run(0, "prefill", x, pad_lens=[0, 2])
+        seq = [t]
+        for _ in range(4):
+            t = stage.run(0, "decode", t.reshape(2, 1))
+            seq.append(t)
+        outs.append(np.stack(seq))
+    np.testing.assert_array_equal(outs[0], outs[1])

@@ -288,11 +288,12 @@ class Server:
                 name=h.name,
                 free_mem=int(res["free_mem"]),
                 layer_time={int(k): float(v) for k, v in res["layer_time"].items()},
+                disk_bw=float(res.get("disk_bw", 0.0)),
             )
             h.spec = ModelSpec(**res["spec"])
             self.state.hosts[h.name]["mem_total"] = res.get("total_mem", self.state.hosts[h.name]["mem_total"])
             lt = ", ".join(f"b{k}={v * 1e3:.1f}ms" for k, v in sorted(h.profile.layer_time.items()))
-            self.state.log(f"{h.name}: {h.profile.free_mem / 1e9:.1f} GB free, per layer {lt}")
+            self.state.log(f"{h.name}: {h.profile.free_mem / 1e9:.1f} GB free, disk {h.profile.disk_bw / 1e9:.1f} GB/s, per layer {lt}")
 
         await asyncio.gather(*[prof(self.hosts[n]) for n in names])
         self.spec = self.hosts[names[0]].spec
@@ -334,6 +335,7 @@ class Server:
         for i, name in enumerate(p.order):
             self.state.hosts[name]["stage"] = i
             self.state.hosts[name]["layers"] = p.layers[i]
+            self.state.hosts[name]["streamed"] = p.layers[i][1] - p.layers[i][0] - p.resident[i]
         self.state.links = []
         S = len(p.order)
         for i in range(S):
@@ -342,7 +344,7 @@ class Server:
             self.state.links.append({"src": src, "dst": dst, "used": 0.0, "capacity": lp.bandwidth, "carries": "token ids" if i == S - 1 else "hidden states"})
         self.state.log(
             "placement: "
-            + "  ".join(f"{n}:{a}-{b - 1}" for n, (a, b) in zip(p.order, p.layers))
+            + "  ".join(f"{n}:{a}-{b - 1}" + (f" ({b - a - r} from disk)" if b - a > r else "") for n, (a, b), r in zip(p.order, p.layers, p.resident))
             + f"  micro-batch {p.micro_batch} x {p.num_micro_batches}  predicted {p.predicted_tok_s:.1f} tok/s (peak {p.peak_tok_s:.1f})"
         )
 
@@ -361,19 +363,20 @@ class Server:
                     job=self.job,
                     model=self.model,
                     layers=list(p.layers[i]),
+                    resident=p.resident[i],
                     stage=i,
                     num_stages=S,
                     next={"name": nxt_name, "host": nxt.host, "port": nxt.port} if S > 1 else None,
                     max_tokens=self.max_tokens,
                     max_prompt_tokens=max_prompt_tokens,
-                    micro_batch=p.micro_batch,
-                    num_micro_batches=p.num_micro_batches,
                 ),
                 "loaded",
                 timeout=3600,
             )
             self.state.hosts[name]["mem_used"] = res.get("mem_used", 0)
-            self.state.log(f"{name}: loaded layers {p.layers[i][0]}-{p.layers[i][1] - 1} in {res.get('load_seconds', 0):.1f}s")
+            a, b = p.layers[i]
+            streamed = f", {b - a - p.resident[i]} streamed from disk" if b - a > p.resident[i] else ""
+            self.state.log(f"{name}: loaded layers {a}-{b - 1} in {res.get('load_seconds', 0):.1f}s{streamed}")
 
         # Load in ring order so each stage's "next" is listening before we connect:
         # every host already listens on its port, so loading in parallel is safe.
