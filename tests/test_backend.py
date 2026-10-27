@@ -9,6 +9,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("mlx_lm")
 
+from mlx.utils import tree_flatten  # noqa: E402
 from slugai.backend import Backend  # noqa: E402
 from tests.helpers import mlx_lm_reference  # noqa: E402
 
@@ -101,4 +102,6 @@ def test_streamed_layers_match_resident(tiny_model):
             t = stage.run(0, "decode", t.reshape(2, 1))
             seq.append(t)
         outs.append(np.stack(seq))
+        if resident is not None:  # between steps, streamed layers hold no weights (the next one's are read ahead)
+            assert all(v.size == 0 for l in stage.inner.layers[1:] for _, v in tree_flatten(l.parameters()))
     np.testing.assert_array_equal(outs[0], outs[1])

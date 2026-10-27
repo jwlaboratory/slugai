@@ -185,12 +185,15 @@ def test_streams_a_model_bigger_than_all_memory():
     for i, name in enumerate(p.order):
         a, e = p.layers[i]
         extra = (spec.embed_bytes if i == 0 else 0) + (spec.head_bytes if i == len(p.order) - 1 else 0)
-        buffer = spec.layer_bytes if streamed[name] else 0
+        buffer = 2 * spec.layer_bytes if streamed[name] else 0  # the layer in use and the next, read ahead
         used = p.resident[i] * spec.layer_bytes + buffer + (e - a) * B * spec.cache_bytes_per_seq(300) + extra
         assert used <= hosts[name].free_mem
-    # the stage times include reading the streamed layers from disk
+    # the stage times include the part of each streamed layer's read that compute doesn't hide
     i = p.order.index("pro")
-    assert p.stage_compute[i] >= streamed["pro"] * spec.layer_bytes / 5e9
+    a, e = p.layers[i]
+    t = hosts["pro"].time_per_layer(p.micro_batch)
+    assert p.stage_compute[i] == pytest.approx((e - a) * t + streamed["pro"] * max(0.0, spec.layer_bytes / 5e9 - t))
+    assert streamed["pro"] * (spec.layer_bytes / 5e9 - t) > 0  # reads aren't hidden entirely here
 
 
 def test_no_streaming_when_the_model_fits():

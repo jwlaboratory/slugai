@@ -55,7 +55,7 @@ import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from mlx_lm.models.cache import BatchKVCache, make_prompt_cache
 from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
 
@@ -166,12 +166,14 @@ def _stream(model, layer, index: int, files: dict[str, Path]) -> dict:
     """Make ``layer`` (global number ``index``) read its weights from disk for each call and drop them after.
 
     Returns the layer's prefetch state: set ``state["next"]`` to the next
-    streamed layer's state, and while this layer computes, that layer's
-    weights are read ahead (after the stage's last streamed layer, the
-    first's, for the next micro-batch), so disk reads overlap compute.
+    streamed layer's state (after the stage's last streamed layer, the
+    first's, for the next micro-batch). While this layer computes, the next
+    one's weights are read from disk and the one after's file headers are
+    parsed, so reads overlap compute and start without waiting on the parse.
     """
     prefix = f"model.layers.{index}."
-    state: dict = {"ready": None, "next": None}  # weights being read ahead; the next streamed layer's state
+    # unread weights (headers parsed); weights being read; the next streamed layer's state
+    state: dict = {"parsed": None, "ready": None, "next": None}
     owning = sorted({f for k, f in files.items() if k.startswith(prefix)})
 
     def load() -> dict:  # the layer's weights as unread arrays: mx.load only parses headers
@@ -184,10 +186,16 @@ def _stream(model, layer, index: int, files: dict[str, Path]) -> dict:
     have = {k: v.shape for k, v in tree_flatten(load())}
     if want != have:
         raise ValueError(f"can't stream layer {index}: its weights on disk don't match the model ({sorted(set(want) ^ set(have))[:3]})")
+    # what the layer holds between uses: empty arrays of the weights' dtypes. Cheaper to
+    # swap in than unread ones, since mx.load parses the whole file's header every call
+    empty = tree_map(lambda v: mx.zeros((0,), dtype=v.dtype), layer.parameters())
     base = type(layer)
 
-    def prefetch() -> None:
-        state["ready"] = load()
+    def parse() -> None:
+        state["parsed"] = load()
+
+    def read() -> None:
+        state["ready"], state["parsed"] = state["parsed"] if state["parsed"] is not None else load(), None
         mx.async_eval(state["ready"])
 
     def __call__(self, *args, **kwargs):
@@ -197,14 +205,16 @@ def _stream(model, layer, index: int, files: dict[str, Path]) -> dict:
         cache = kwargs.get("cache", args[2] if len(args) > 2 else None)
         todo = [out, cache.state if cache is not None else []]
         mx.async_eval(todo)  # queue this layer first...
-        state["next"]["prefetch"]()  # ...then read the next streamed layer while it computes
+        nxt = state["next"]
+        nxt["read"]()  # ...then read the next streamed layer while it computes
+        nxt["next"]["parse"]()  # and parse the one after's headers (mx.load parses a whole file's)
         mx.eval(todo)  # finish with the weights...
-        self.update(load())  # ...then swap in unread ones, freeing these
+        self.update(empty)  # ...then drop them, freeing the memory
         return out
 
     layer.__class__ = type(f"Streamed{base.__name__}", (base,), {"__call__": __call__})
-    layer.update(load())
-    state["prefetch"], state["next"] = prefetch, state
+    layer.update(empty)
+    state.update(parse=parse, read=read, next=state)
     return state
 
 
@@ -467,7 +477,8 @@ class Backend:
             streams = [_stream(model, inner.layers[j], a + j, files) for j in range(keep, b - a)]
             for s, nxt in zip(streams, streams[1:] + streams[:1]):
                 s["next"] = nxt
-            streams[0]["prefetch"]()  # the first micro-batch's first streamed layer
+            streams[0]["read"]()  # the first micro-batch's first streamed layer
+            streams[0]["next"]["parse"]()
         tie = bool(getattr(model.args, "tie_word_embeddings", False))
         to_eval = [l.parameters() for l in inner.layers[:keep]]
         if first or (last and tie):

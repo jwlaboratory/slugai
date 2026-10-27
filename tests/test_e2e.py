@@ -294,7 +294,7 @@ async def test_ring_streams_layers_that_do_not_fit(tiny, tmp_path):
     """Hosts too small for the model stream the rest of their layers from disk, with identical output."""
     spec = Backend(use_chat_template=False).model_info(str(tiny)).spec
     # room for half the layers' caches (8 sequences, one 256-token block), the embedding and head,
-    # and 2.5 layers of weights: one resident, one to stream through
+    # and 2.5 layers of weights: room to stream through (the layer in use and the next, read ahead)
     room = spec.embed_bytes + spec.head_bytes + spec.num_layers // 2 * 8 * spec.cache_bytes_per_seq(1) + int(2.5 * spec.layer_bytes)
 
     class SmallMemory(Backend):

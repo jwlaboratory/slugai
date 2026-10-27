@@ -115,13 +115,15 @@ by hand.
 
    **Streaming** (FlexGen-style): when the model is bigger than all the Macs'
    memory together, a Mac keeps `R_i` of its layers in memory and streams the
-   rest: each is read from disk for every micro-batch, through one layer's
-   worth of spare room (`R_i * w + w + L_i * B * (k * c + s) <= m_i`). A
-   streamed layer adds `w / disk_i` seconds to its stage, with each Mac's disk
-   read speed measured during profiling, so the planner streams only what
-   doesn't fit, on the Macs with the fastest disks, and favours big batches
-   that spread each read over many sequences. It runs, but slowly: reading
-   weights every step is far slower than keeping them.
+   rest: each is read from disk for every micro-batch, through two layers'
+   worth of spare room, the layer in use and the next, which is read while
+   the one before it computes (`R_i * w + 2 * w + L_i * B * (k * c + s) <= m_i`). A
+   streamed layer adds the part of its read that compute doesn't hide,
+   `max(0, w / disk_i - t_i)` seconds, to its stage, with each Mac's disk read
+   speed measured during profiling, so the planner streams only what doesn't
+   fit, on the Macs with the fastest disks, and favours big batches that spread
+   each read over many sequences. It runs, but slowly: reading weights every
+   step is far slower than keeping them.
 3. **Load.** Each host loads just its layers (plus the embedding on stage 1,
    the final norm and lm_head on the last stage) and connects to the next host.
 4. **Prefill / decode.** The server feeds prompts into free slots; stage 1
@@ -172,9 +174,11 @@ through. KV caches are mlx-lm's batch caches (`BatchKVCache`, and
 `ArraysCache` for the linear-attention layers of hybrid models such as
 Qwen3-Next), which handle padding and per-sequence RoPE offsets. Hidden
 states stay in the model's dtype between Macs, so a ring produces exactly the
-tokens one Mac would. A streamed layer's weights are unread (lazy) arrays
-pointing into the safetensors files: before each use they're read, after it
-they're swapped for unread ones again, which frees the memory.
+tokens one Mac would. A streamed layer's weights are read from the
+safetensors files ahead of use, while the previous streamed layer computes
+(the stage's first streamed layer while the last one computes, for the next
+micro-batch); after use they're swapped for empty arrays, which frees the
+memory.
 `slugai host --max-memory GB` caps what a Mac offers (to leave room for other
 apps, or to try streaming with a small model). Needs mlx ≥ 0.32.3 and mlx-lm ≥ 0.32; older versions
 break the batch caches.

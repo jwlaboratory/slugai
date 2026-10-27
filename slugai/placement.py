@@ -23,9 +23,11 @@ also holds the embedding table, the last stage the final norm and lm_head.
 
 Streaming (FlexGen-style): when a Mac's layers don't all fit, it keeps
 ``R_i`` of them in memory and *streams* the rest, reading each from disk for
-every micro-batch through one layer's worth of spare room:
-``R_i * w + w + L_i * B * (k * c + s) <= m_i``, and the stage's time grows by
-``(L_i - R_i) * w / disk_bw_i``. That lets the ring run a model bigger than
+every micro-batch through two layers' worth of spare room (the layer in use
+and the next, read ahead while it computes):
+``R_i * w + 2 * w + L_i * B * (k * c + s) <= m_i``. A layer's read overlaps the
+previous layer's compute, so the stage's time grows by what compute doesn't
+hide: ``(L_i - R_i) * max(0, w / disk_bw_i - t_i)``. That lets the ring run a model bigger than
 all its memory, slowly; the split minimises the slowest stage either way.
 """
 
@@ -175,27 +177,29 @@ def _stage_costs(spec: ModelSpec, host: HostProfile, b: int, B: int, context: in
     """For 0..L layers on ``host``: seconds per micro-batch (inf: can't fit) and how many stay in memory.
 
     Layers that don't fit next to the caches are streamed: kept on disk and
-    read for every micro-batch, through one layer's worth of spare room.
+    read for every micro-batch, through two layers' worth of spare room (one in
+    use, the next read ahead).
     """
     L, w = spec.num_layers, spec.layer_bytes
     t = host.time_per_layer(b)
     read = w / host.disk_bw if host.disk_bw > 0 else INF
     cache = B * spec.cache_bytes_per_seq(context)
+    stall = max(0.0, read - t)  # per streamed layer: the read the previous layer's compute doesn't hide
     cost, keep = [INF] * (L + 1), [0] * (L + 1)
     for l in range(1, L + 1):
         room = host.free_mem - extra - l * cache
         if room >= l * w:
             cost[l], keep[l] = l * t, l
-        elif read < INF and room >= w:
-            r = int(room // w) - 1
-            cost[l], keep[l] = l * t + (l - r) * read, r
+        elif read < INF and room >= 2 * w:
+            r = int(room // w) - 2
+            cost[l], keep[l] = l * t + (l - r) * stall, r
     return cost, keep
 
 
 def _stage_time(spec: ModelSpec, host: HostProfile, b: int, layers: int, resident: int) -> float:
     """Seconds per micro-batch for ``layers`` layers on ``host``, ``resident`` of them in memory."""
-    streamed = layers - resident
-    return layers * host.time_per_layer(b) + (streamed * spec.layer_bytes / host.disk_bw if streamed > 0 else 0.0)
+    streamed, t = layers - resident, host.time_per_layer(b)
+    return layers * t + (streamed * max(0.0, spec.layer_bytes / host.disk_bw - t) if streamed > 0 else 0.0)
 
 
 # --------------------------------------------------------------------------- solve
