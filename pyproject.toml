@@ -16,17 +16,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mlx = ["mlx>=0.22", "mlx-lm>=0.22"]
+mlx = ["mlx>=0.32.3", "mlx-lm>=0.32"]  # earlier versions break batched caches (verified: 0.32.3 / 0.32.0)
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 # MLX backend tests on Linux CI use the CPU build: pip install "mlx[cpu]" mlx-lm transformers
 
 
 [project.scripts]
 slugai = "slugai.cli:main"
-slowring = "slugai.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["slugai*"]
+
+[tool.setuptools.package-data]
+slugai = ["data/*.jsonl"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

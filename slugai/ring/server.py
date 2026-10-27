@@ -17,29 +17,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import __version__
-from .backend import ModelInfo
-from .discovery import HostAddr, browse, parse_hosts
-from .placement import (
+from .. import __version__
+from ..net.discovery import HostAddr, browse, parse_hosts
+from ..placement import (
     HostProfile,
     LinkProfile,
     ModelSpec,
     Placement,
     PlacementError,
     rebalance_with_measurements,
+    same_layout,
     should_rebalance,
     solve,
 )
-from .prompts import load_prompts
-from .protocol import Frame, pack
-from .transport import Connection, ConnectionClosed, connect
+from ..net.protocol import Frame, pack
+from ..net.transport import Connection, ConnectionClosed, connect
+from ..prompts import load_prompts
 
 log = logging.getLogger(__name__)
 
@@ -53,16 +52,13 @@ class HostClient:
         self.addr = addr
         self.conn = conn
         self.name = addr.name
-        self.welcome: dict = {}
         self.profile: Optional[HostProfile] = None
-        self.model_info: Optional[ModelInfo] = None
+        self.spec: Optional[ModelSpec] = None
         self.prompt_lengths: Optional[list[int]] = None
         self.stats: dict = {}
-        self.stage: Optional[int] = None
         self._waiters: dict[str, asyncio.Future] = {}
         self._on_event = on_event
         self._reader = asyncio.create_task(self._read_loop())
-        self.error: Optional[str] = None
 
     async def _read_loop(self) -> None:
         try:
@@ -78,7 +74,6 @@ class HostClient:
                     if fut is not None and not fut.done():
                         fut.set_exception(RuntimeError(f"{self.name}: {f.get('message')}"))
                         continue
-                    self.error = f.get("message")
                 self._on_event(self, f)
         except ConnectionClosed:
             for fut in self._waiters.values():
@@ -141,9 +136,7 @@ class JobState:
     events: deque = field(default_factory=lambda: deque(maxlen=200))
     finished: bool = False
     error: Optional[str] = None
-    paused: bool = False
     rebalances: int = 0
-    message: str = ""
 
     def log(self, msg: str) -> None:
         self.events.append((time.time(), msg))
@@ -202,16 +195,18 @@ class Server:
         self.hosts: dict[str, HostClient] = {}
         self.links: dict[tuple[str, str], LinkProfile] = {}
         self.spec: Optional[ModelSpec] = None
-        self.model_info: Optional[ModelInfo] = None
         self.placement: Optional[Placement] = None
         self.context: int = 0
         self.outputs: dict[int, dict] = {}
         self.pending: deque[int] = deque(range(len(prompts)))
         self.free_slots: deque[int] = deque()
-        self.slot_prompt_ids: dict[int, list[int]] = {}
         self.busy_slots: set[int] = set()
-        self._all_idle = asyncio.Event()
+        # fed prompts whose outputs haven't arrived: the last stage sends them to the
+        # server on its own connection, so they can trail stage 1's slot_free
+        self.awaiting_outputs: set[int] = set()
+        self._fill_tasks: set[asyncio.Task] = set()
         self._draining = False
+        self._proposed: Optional[Placement] = None
         self._stop = asyncio.Event()
         self.report: dict = {"job": self.job, "model": model, "version": __version__, "rebalances": []}
         self._last_tokens: dict[str, tuple[float, int]] = {}
@@ -260,15 +255,14 @@ class Server:
             fut = client.expect("welcome")
             await client.send(pack("hello", job=self.job, model=self.model, version=__version__))
             welcome = await asyncio.wait_for(fut, 30)
-            client.welcome = welcome.body
             name = welcome["name"]
             if name in self.hosts:
                 name = f"{name}-{len(self.hosts)}"
             client.name = name
             client.addr = HostAddr(name, welcome.get("ip", a.host), int(welcome.get("port", a.port)))
             self.hosts[name] = client
-            self.state.hosts[name] = {"stage": None, "layers": None, "busy": 0.0, "step": 0.0, "mem_used": 0, "mem_total": welcome.get("total_mem", 0), "bytes_out": 0, "backend": welcome.get("backend")}
-            self.state.log(f"host {name} ({welcome.get('backend')}, {welcome.get('free_mem', 0) / 1e9:.1f} GB free) at {client.addr.host}:{client.addr.port}")
+            self.state.hosts[name] = {"stage": None, "layers": None, "busy": 0.0, "step": 0.0, "mem_used": 0, "mem_total": welcome.get("total_mem", 0), "bytes_out": 0}
+            self.state.log(f"host {name} ({welcome.get('free_mem', 0) / 1e9:.1f} GB free) at {client.addr.host}:{client.addr.port}")
 
     async def _profile(self) -> None:
         self._set_phase("profile")
@@ -285,9 +279,8 @@ class Server:
                 name=h.name,
                 free_mem=int(res["free_mem"]),
                 layer_time={int(k): float(v) for k, v in res["layer_time"].items()},
-                prefill_layer_time_per_token=float(res.get("prefill_layer_time_per_token", 0.0)),
             )
-            h.model_info = ModelInfo.from_dict(res["model_info"])
+            h.spec = ModelSpec(**res["spec"])
             if res.get("prompt_lengths") is not None:
                 h.prompt_lengths = list(res["prompt_lengths"])
             self.state.hosts[h.name]["mem_total"] = res.get("total_mem", self.state.hosts[h.name]["mem_total"])
@@ -295,8 +288,7 @@ class Server:
             self.state.log(f"{h.name}: {h.profile.free_mem / 1e9:.1f} GB free, per layer {lt}")
 
         await asyncio.gather(*[prof(i, self.hosts[n]) for i, n in enumerate(names)])
-        self.model_info = self.hosts[names[0]].model_info
-        self.spec = self.model_info.spec
+        self.spec = self.hosts[names[0]].spec
         lengths = self.hosts[names[0]].prompt_lengths or [max(8, len(p) // 3) for p in self.prompts]
         self.context = max(lengths) + self.max_tokens
         self.state.log(f"model {self.model}: {self.spec.num_layers} layers, hidden {self.spec.hidden_size}, context budget {self.context}")
@@ -321,7 +313,13 @@ class Server:
         self._set_phase("place")
         profiles = {n: h.profile for n, h in self.hosts.items()}
         self.placement = solve(
-            self.spec, profiles, self.links, context=self.context, micro_batch=self.micro_batch, num_micro_batches=self.num_micro_batches
+            self.spec,
+            profiles,
+            self.links,
+            context=self.context,
+            micro_batch=self.micro_batch,
+            num_micro_batches=self.num_micro_batches,
+            max_sequences=len(self.prompts),
         )
         self._announce_placement(self.placement)
         self.report["placement"] = self.placement.to_dict()
@@ -331,7 +329,6 @@ class Server:
         for i, name in enumerate(p.order):
             self.state.hosts[name]["stage"] = i
             self.state.hosts[name]["layers"] = p.layers[i]
-            self.hosts[name].stage = i
         self.state.links = []
         S = len(p.order)
         for i in range(S):
@@ -381,13 +378,12 @@ class Server:
         await asyncio.gather(*[h.request(pack("start"), "started", timeout=30) for h in self.hosts.values()])
         self.free_slots = deque(range(self.placement.num_micro_batches))
         self.busy_slots.clear()
+        self._last_tokens.clear()  # stages restart their token counters
         self._draining = False
         if self.state.decode_started is None:
             self.state.decode_started = time.monotonic()
-        if not self._tasks:
-            self._tasks.append(asyncio.create_task(self._stats_loop()))
-            if self.rebalance_enabled and len(self.hosts) > 1:
-                self._tasks.append(asyncio.create_task(self._rebalance_loop()))
+        if self.rebalance_enabled and len(self.hosts) > 1 and not self._tasks:
+            self._tasks.append(asyncio.create_task(self._rebalance_loop()))
 
     async def _decode(self) -> None:
         self._set_phase("prefill")
@@ -397,7 +393,7 @@ class Server:
             if self._stop.is_set():
                 self.state.log("stopping on request")
                 return
-            if not self.pending and not self.busy_slots:
+            if not self.pending and not self.busy_slots and not self.awaiting_outputs:
                 return
             if self._draining and not self.busy_slots:
                 await self._do_rebalance()
@@ -412,8 +408,8 @@ class Server:
     async def _feed_slot(self, slot: int) -> None:
         b = self.placement.micro_batch
         ids = [self.pending.popleft() for _ in range(min(b, len(self.pending)))]
-        self.slot_prompt_ids[slot] = ids
         self.busy_slots.add(slot)
+        self.awaiting_outputs.update(ids)
         first = self.hosts[self.placement.order[0]]
         await first.send(pack("feed", slot=slot, ids=ids, prompts=[self.prompts[i] for i in ids]))
 
@@ -424,25 +420,29 @@ class Server:
             for i in range(len(self.prompts)):
                 rec = self.outputs.get(i, {"id": i, "prompt": self.prompts[i], "completion": None, "tokens": 0})
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        elapsed = self.state.elapsed
-        decode_elapsed = time.monotonic() - (self.state.decode_started or self.state.started)
-        self.report.update(
-            {
-                "sequences": len(self.prompts),
-                "sequences_done": len(self.outputs),
-                "tokens_generated": self.state.tokens_generated,
-                "elapsed_seconds": elapsed,
-                "decode_seconds": decode_elapsed,
-                "tok_s": self.state.tokens_generated / max(decode_elapsed, 1e-9),
-                "tok_h": self.state.tokens_generated / max(decode_elapsed, 1e-9) * 3600,
-                "output": str(out),
-                "hosts": self.state.hosts,
-            }
-        )
+        self.report.update(self._summary())
         if self.report_path:
             Path(self.report_path).parent.mkdir(parents=True, exist_ok=True)
             Path(self.report_path).write_text(json.dumps(self.report, indent=2, default=str))
-        self.state.log(f"done: {len(self.outputs)}/{len(self.prompts)} sequences, {self.state.tokens_generated} tokens in {decode_elapsed:.0f}s = {self.report['tok_s']:.1f} tok/s; wrote {out}")
+        r = self.report
+        self.state.log(f"done: {r['sequences_done']}/{r['sequences']} sequences, {r['tokens_generated']} tokens in {r['decode_seconds']:.0f}s = {r['tok_s']:.1f} tok/s; wrote {out}")
+
+    def _summary(self) -> dict:
+        decode_s = time.monotonic() - (self.state.decode_started or self.state.started)
+        tok_s = self.state.tokens_generated / max(decode_s, 1e-9)
+        return {
+            "sequences": len(self.prompts),
+            "sequences_done": len(self.outputs),
+            "partial": len(self.outputs) < len(self.prompts),
+            "tokens_generated": self.state.tokens_generated,
+            "elapsed_seconds": self.state.elapsed,
+            "decode_seconds": decode_s,
+            "tok_s": tok_s,
+            "tok_h": tok_s * 3600,
+            "output": self.output_path,
+            "hosts": self.state.hosts,
+            "links": [dict(l) for l in self.state.links],
+        }
 
     # ------------------------------------------------------------------ events
 
@@ -455,10 +455,11 @@ class Server:
         elif t == "slot_free":
             slot = int(f["slot"])
             self.busy_slots.discard(slot)
-            self.slot_prompt_ids.pop(slot, None)
             self.free_slots.append(slot)
             if self.pending and not self._draining and not self._stop.is_set():
-                asyncio.create_task(self._fill_slots())
+                task = asyncio.create_task(self._fill_slots())
+                self._fill_tasks.add(task)
+                task.add_done_callback(self._fill_tasks.discard)
         elif t == "error":
             self.state.log(f"{h.name} error: {f.get('message')}")
             self.state.error = f"{h.name}: {f.get('message')}"
@@ -488,7 +489,7 @@ class Server:
             tg = int(f.get("tokens_generated", 0))
             prev = self._last_tokens.get(h.name)
             self._last_tokens[h.name] = (now, tg)
-            if prev and now > prev[0]:
+            if prev and now > prev[0] and tg >= prev[1]:  # the counter restarts when a stage reloads
                 self.state.tok_s_window.append((tg - prev[1]) / (now - prev[0]))
                 recent = list(self.state.tok_s_window)[-10:]
                 self.state.tok_s = sum(recent) / len(recent)
@@ -498,17 +499,11 @@ class Server:
         ptoks = f.get("prompt_tokens") or [None] * len(ids)
         for i, tk, tx, pt in zip(ids, toks, texts, ptoks):
             self.outputs[int(i)] = {"id": int(i), "prompt": self.prompts[int(i)], "completion": tx, "tokens": len(tk), "prompt_tokens": pt, "token_ids": [int(t) for t in tk]}
+            self.awaiting_outputs.discard(int(i))
             self.state.tokens_generated += len(tk)
         self.state.done_sequences = len(self.outputs)
 
     # ------------------------------------------------------------------ loops
-
-    async def _stats_loop(self) -> None:
-        try:
-            while not self.state.finished:
-                await asyncio.sleep(1.0)
-        except asyncio.CancelledError:
-            pass
 
     async def _rebalance_loop(self) -> None:
         try:
@@ -522,7 +517,11 @@ class Server:
             pass
 
     def maybe_rebalance(self, force: bool = False) -> bool:
-        """Compare live step times to the plan; if a Mac slowed down, drain and re-place."""
+        """Compare live step times to the plan; if a Mac slowed down, drain and re-place.
+
+        ``force`` (the dashboard's [r]) skips the minimum-gain rule but still
+        needs a different, faster layout.
+        """
         if self.placement is None or self._draining:
             return False
         measured = {}
@@ -534,21 +533,24 @@ class Server:
             return False
         profiles = {n: h.profile for n, h in self.hosts.items()}
         try:
-            proposed = rebalance_with_measurements(self.placement, self.spec, profiles, self.links, measured)
+            now, proposed = rebalance_with_measurements(self.placement, self.spec, profiles, self.links, measured)
         except PlacementError as e:
             self.state.log(f"rebalance: {e}")
             return False
-        if force or should_rebalance(self.placement, proposed):
+        better = not same_layout(now, proposed) and proposed.predicted_tok_s > now.predicted_tok_s
+        if should_rebalance(now, proposed) or (force and better):
             self._proposed = proposed
             self._draining = True
             self.state.log(
-                "rebalance planned: " + "  ".join(f"{n}:{a}-{b - 1}" for n, (a, b) in zip(proposed.order, proposed.layers)) + " — draining slots"
+                "rebalance planned: "
+                + "  ".join(f"{n}:{a}-{b - 1}" for n, (a, b) in zip(proposed.order, proposed.layers))
+                + f" ({now.predicted_tok_s:.1f} -> {proposed.predicted_tok_s:.1f} tok/s predicted) — draining slots"
             )
             return True
         return False
 
     async def _do_rebalance(self) -> None:
-        proposed = getattr(self, "_proposed", None)
+        proposed, self._proposed = self._proposed, None
         self._draining = False
         if proposed is None:
             return
@@ -562,32 +564,13 @@ class Server:
         await self._start()
         self._set_phase("decode")
         self.report["rebalances"].append({"at": self.state.elapsed, "from": old.to_dict(), "to": proposed.to_dict()})
-        self._proposed = None
-
-    async def pause(self) -> None:
-        self.state.paused = True
-        await asyncio.gather(*[h.send(pack("pause")) for h in self.hosts.values()], return_exceptions=True)
-
-    async def resume(self) -> None:
-        self.state.paused = False
-        await asyncio.gather(*[h.send(pack("resume")) for h in self.hosts.values()], return_exceptions=True)
 
     def stop(self) -> None:
         self._stop.set()
 
     def save_report(self, path: Optional[str] = None) -> str:
         path = path or self.report_path or f"{self.job}-report.json"
-        snap = dict(self.report)
-        snap.update(
-            sequences_done=len(self.outputs),
-            tokens_generated=self.state.tokens_generated,
-            elapsed_seconds=self.state.elapsed,
-            tok_s=self.state.tok_s,
-            hosts=self.state.hosts,
-            links=[dict(l) for l in self.state.links],
-            partial=not self.state.finished,
-        )
-        Path(path).write_text(json.dumps(snap, indent=2, default=str))
+        Path(path).write_text(json.dumps({**self.report, **self._summary()}, indent=2, default=str))
         self.state.log(f"report saved to {path}")
         return path
 
@@ -597,7 +580,7 @@ async def main(args) -> int:
     if not prompts:
         log.error("no prompts in %s", args.prompts)
         return 2
-    hosts = parse_hosts(args.hosts, 47111) if args.hosts else None
+    hosts = parse_hosts(args.hosts) if args.hosts else None
     server = Server(
         model=args.model,
         prompts=prompts,

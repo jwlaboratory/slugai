@@ -17,6 +17,7 @@ from .transport import local_ip
 
 log = logging.getLogger(__name__)
 SERVICE_TYPE = "_slugai._tcp.local."
+DEFAULT_PORT = 47111
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class HostAddr:
 
 
 class Advertiser:
-    """Register this host with Bonjour; ``async with`` or start()/stop()."""
+    """Register this host with Bonjour: start() / stop()."""
 
     def __init__(self, name: str, port: int, properties: Optional[dict] = None, ip: Optional[str] = None):
         self.name = name
@@ -66,13 +67,6 @@ class Advertiser:
             except Exception:
                 pass
             self._zc = None
-
-    async def __aenter__(self):
-        await self.start()
-        return self
-
-    async def __aexit__(self, *exc):
-        await self.stop()
 
 
 async def browse(timeout: float = 30.0, min_hosts: int = 1, settle: float = 2.0) -> list[HostAddr]:
@@ -121,7 +115,7 @@ async def browse(timeout: float = 30.0, min_hosts: int = 1, settle: float = 2.0)
     return sorted(found.values(), key=lambda h: h.name)
 
 
-def parse_hosts(spec: str, default_port: int) -> list[HostAddr]:
+def parse_hosts(spec: str, default_port: int = DEFAULT_PORT) -> list[HostAddr]:
     out = []
     for i, item in enumerate(x.strip() for x in spec.split(",") if x.strip()):
         if ":" in item:

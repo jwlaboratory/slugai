@@ -1,4 +1,4 @@
-"""asyncio connections carrying :mod:`slugai.protocol` frames.
+"""asyncio connections carrying :mod:`slugai.net.protocol` frames.
 
 A :class:`Connection` wraps a StreamReader/StreamWriter pair, counts bytes in
 both directions, and answers heartbeats transparently. Control connections
@@ -32,9 +32,6 @@ class Connection:
         self.writer = writer
         self.name = name
         self.bytes_sent = 0
-        self.bytes_received = 0
-        self.frames_sent = 0
-        self.frames_received = 0
         self.last_seen = time.monotonic()
         self._send_lock = asyncio.Lock()
         self._hb_task: Optional[asyncio.Task] = None
@@ -64,7 +61,6 @@ class Connection:
                 self.closed = True
                 raise ConnectionClosed(f"{self.name}: {e}") from e
         self.bytes_sent += n
-        self.frames_sent += 1
         return n
 
     async def recv(self) -> Frame:
@@ -75,15 +71,13 @@ class Connection:
                 self.closed = True
                 raise ConnectionClosed(self.name)
             self.last_seen = time.monotonic()
-            self.frames_received += 1
-            self.bytes_received += f.wire_bytes
             if f.type == "heartbeat":
                 continue
             return f
 
-    def start_heartbeat(self, interval: float = HEARTBEAT_INTERVAL) -> None:
+    def start_heartbeat(self, interval: Optional[float] = None) -> None:
         if self._hb_task is None:
-            self._hb_task = asyncio.create_task(self._heartbeat(interval))
+            self._hb_task = asyncio.create_task(self._heartbeat(interval or HEARTBEAT_INTERVAL))
 
     async def _heartbeat(self, interval: float) -> None:
         try:

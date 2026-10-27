@@ -1,53 +1,24 @@
-"""bench baselines, doctor, profile and prep-model CLIs (fake backend)."""
+"""bench, doctor and prep-model from the command line, and the built-in prompts."""
 
 import json
 import subprocess
 import sys
 
-import pytest
-
-from slugai.backend import FakeBackend
-from slugai.bench import run_single, run_streaming
-from slugai.cli import build_parser, main as cli_main
-from tests.test_fake_backend import reference_generate
+from slugai.cli import main as cli_main
 
 PROMPTS = ["the quick brown fox", "hi", "a much longer prompt than the others, indeed", "zebra", "x"]
 
 
-@pytest.mark.parametrize("side", ["left", "right"])
-def test_bench_single_matches_reference(side):
-    be = FakeBackend(slow_ms=0, padding_side=side)
-    ref = reference_generate(FakeBackend(slow_ms=0), "fake-L6", PROMPTS, 9)
-    outs, stats = run_single(be, "fake-L6", PROMPTS, max_tokens=9, batch=2)
-    assert outs == ref
-    assert stats["tokens_generated"] == sum(len(g) for g in ref) and stats["tok_s"] > 0
-
-
-def test_bench_streaming_matches_reference():
-    be = FakeBackend(slow_ms=0)
-    ref = reference_generate(be, "fake-L6", PROMPTS, 7)
-    outs, stats = run_streaming(be, "fake-L6", PROMPTS, max_tokens=7, batch=3)
-    assert outs == ref
-    assert stats["layer_loads"] > 6
-
-
-def test_bench_cli(tmp_path):
+def test_bench_cli(tiny, tmp_path):
     p = tmp_path / "p.txt"
     p.write_text("\n".join(PROMPTS))
     rep = tmp_path / "rep.json"
-    rc = cli_main(["bench", "single", "--model", "fake-L4", "--prompts", str(p), "--backend", "fake", "--max-tokens", "5", "--report", str(rep)])
+    rc = cli_main(["bench", "--model", str(tiny), "--prompts", str(p), "--max-tokens", "5", "--report", str(rep)])
     assert rc == 0
     stats = json.loads(rep.read_text())
-    assert stats["prompts"] == len(PROMPTS) and stats["baseline"] == "single"
+    assert stats["prompts"] == len(PROMPTS) and stats["tok_s"] > 0
     lines = (tmp_path / "rep.jsonl").read_text().splitlines()
     assert len(lines) == len(PROMPTS)
-
-
-def test_profile_cli(capsys):
-    rc = cli_main(["profile", "--model", "fake-L4", "--backend", "fake", "--json"])
-    assert rc == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["num_layers"] == 4 and out["layer_time"]
 
 
 def test_doctor_runs():
@@ -61,3 +32,14 @@ def test_prep_model_local_dir(tmp_path, capsys):
     rc = cli_main(["prep-model", str(tmp_path)])
     assert rc == 0
     assert "1 shard" in capsys.readouterr().out
+
+
+def test_builtin_sample_prompts(tiny, tmp_path):
+    from slugai.prompts import load_prompts
+
+    sample = load_prompts()
+    assert len(sample) == 300 and all(isinstance(p, str) and p for p in sample)
+    assert load_prompts(limit=3) == sample[:3]
+    rep = tmp_path / "rep.json"  # no --prompts: the sample is used
+    rc = cli_main(["bench", "--model", str(tiny), "--max-tokens", "3", "--limit", "4", "--report", str(rep)])
+    assert rc == 0 and json.loads(rep.read_text())["prompts"] == 4
