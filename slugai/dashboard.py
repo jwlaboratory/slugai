@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import time
 from typing import TYPE_CHECKING
 
@@ -96,8 +97,28 @@ def render(server: "Server") -> str:
 
 
 async def run_plain(server: "Server", interval: float = 5.0) -> int:
-    """No dashboard: log phase changes and a status line every ``interval`` seconds."""
+    """No dashboard: log phase changes and a status line every ``interval`` seconds.
+
+    The first Ctrl-C stops the job and still writes the completions so far;
+    a second one aborts without writing.
+    """
     task = asyncio.create_task(server.run())
+    loop = asyncio.get_running_loop()
+    interrupted = False
+
+    def on_sigint() -> None:
+        nonlocal interrupted
+        if interrupted:
+            task.cancel()
+            return
+        interrupted = True
+        server.state.log("stopping: writing the completions so far (Ctrl-C again to abort)")
+        server.stop()
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, on_sigint)
+    except (NotImplementedError, RuntimeError, ValueError):  # no signals here (not the main thread)
+        pass
     last = 0.0
     try:
         while not task.done():
@@ -115,9 +136,18 @@ async def run_plain(server: "Server", interval: float = 5.0) -> int:
                     "  ".join(f"{n}:{h.get('busy', 0) * 100:.0f}%/{h.get('step', 0):.2f}s" for n, h in st.hosts.items()),
                 )
         await task
-    except KeyboardInterrupt:
-        server.stop()
-        await task
+    except asyncio.CancelledError:
+        if not task.cancelled():
+            raise
+        log.warning("aborted; no results written")
+        return 130
+    finally:
+        try:
+            loop.remove_signal_handler(signal.SIGINT)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+    if interrupted:
+        return 130
     return 1 if server.state.error else 0
 
 
@@ -161,6 +191,9 @@ async def run_tui(server: "Server", headless: bool = False) -> int:
                 server.save_report()
             except Exception as e:
                 server.state.log(f"save failed: {e}")
+
+        async def action_quit(self) -> None:  # Textual's ctrl+q: stop the job properly too
+            await self.action_quit_job()
 
         async def action_quit_job(self) -> None:
             server.stop()

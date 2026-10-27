@@ -178,9 +178,23 @@ class HostDaemon:
                 machine=platform.machine(),
             )
         )
+        # Keep reading while a long request (profile, load) runs, so heartbeats are
+        # seen and the connection isn't timed out; requests still run in order.
+        inbox: asyncio.Queue[Optional[Frame]] = asyncio.Queue()
+
+        async def pump() -> None:
+            try:
+                while True:
+                    await inbox.put(await conn.recv())
+            except ConnectionClosed:
+                await inbox.put(None)
+
+        reader = asyncio.create_task(pump())
         try:
             while True:
-                f = await conn.recv()
+                f = await inbox.get()
+                if f is None:
+                    raise ConnectionClosed(conn.name)
                 try:
                     if await self._handle_control(conn, f):
                         break
@@ -192,6 +206,7 @@ class HostDaemon:
         except ConnectionClosed:
             log.info("server went away")
         finally:
+            reader.cancel()
             if self.server_conn is conn:
                 self.server_conn = None
             await self._teardown()
@@ -320,8 +335,9 @@ class HostDaemon:
             await self.next_conn.close()
             self.next_conn = None
         if self.stage is not None:
-            self.stage.unload()
-            self.stage = None
+            stage, self.stage = self.stage, None
+            # on the stage thread, so it waits for a step still running there
+            await asyncio.get_running_loop().run_in_executor(self.executor, stage.unload)
         self.slot_state.clear()
         self.paused.set()
 
@@ -382,13 +398,16 @@ class HostDaemon:
             while True:
                 w = await self.queue.get()
                 await self.paused.wait()
-                if self.stage is None:
+                stage = self.stage
+                if stage is None:
                     continue
                 t0 = time.perf_counter()
-                out = await loop.run_in_executor(self.executor, self.stage.run, w.slot, w.phase, w.x, w.pad_lens)
+                out = await loop.run_in_executor(self.executor, stage.run, w.slot, w.phase, w.x, w.pad_lens)
+                if self.stage is not stage:
+                    continue  # unloaded while this step ran
                 dt = time.perf_counter() - t0
                 self.stats.record(dt, int(w.x.shape[0]), w.phase)
-                if self.stage.last:
+                if stage.last:
                     await self._after_last(w, out)
                 else:
                     await self._send_next(pack("hidden", tensor=out, **w.meta))

@@ -110,11 +110,50 @@ def test_rebalance_moves_layers_off_throttled_host():
     nA = p.layers[iA][1] - p.layers[iA][0]
     measured = {name: p.stage_compute[i] for i, name in enumerate(p.order)}
     measured["A"] *= 2.0  # A is throttling
-    q = rebalance_with_measurements(p, spec, hosts, links, measured)
+    now, q = rebalance_with_measurements(p, spec, hosts, links, measured)
     jA = q.order.index("A")
     assert q.layers[jA][1] - q.layers[jA][0] < nA
-    assert should_rebalance(p, q) or not should_rebalance(p, p)
+    assert now.layers == p.layers and now.predicted_tok_s < p.predicted_tok_s
+    assert should_rebalance(now, q)
     assert not should_rebalance(p, p)
+
+    # A stays throttled on its new share: the next check keeps the layout (no ping-pong)
+    measured2 = {name: q.layers[i][1] - q.layers[i][0] for i, name in enumerate(q.order)}
+    measured2 = {name: n * hosts[name].time_per_layer(q.micro_batch) * (2.0 if name == "A" else 1.0) for name, n in measured2.items()}
+    now2, q2 = rebalance_with_measurements(q, spec, hosts, links, measured2)
+    assert not should_rebalance(now2, q2)
+
+
+def test_no_rebalance_when_hosts_run_as_profiled():
+    spec, hosts, links = spec_70b(), hosts_abc(), links_abc()
+    p = solve(spec, hosts, links, context=512)
+    measured = {name: p.stage_compute[i] for i, name in enumerate(p.order)}
+    now, q = rebalance_with_measurements(p, spec, hosts, links, measured)
+    assert now.predicted_tok_s == pytest.approx(p.predicted_tok_s)
+    assert not should_rebalance(now, q)
+
+
+def test_small_job_spreads_over_micro_batches():
+    spec, hosts, links = spec_70b(), hosts_abc(), links_abc()
+    assert solve(spec, hosts, links, context=512).micro_batch > 14
+    p = solve(spec, hosts, links, context=512, max_sequences=40)  # 40 prompts, 3 hosts
+    assert p.micro_batch <= 14 and p.num_micro_batches >= 3
+
+
+def test_per_sequence_state_counts_against_memory():
+    spec, hosts, links = spec_70b(), hosts_abc(), links_abc()
+    lean = solve(spec, hosts, links, context=512)
+    # e.g. Qwen3-Next linear attention: ~1.6 MB of state per layer per sequence
+    spec.state_bytes_per_seq = int(1.6e6)
+    spec.kv_block_tokens = 256
+    heavy = solve(spec, hosts, links, context=300)
+    assert heavy.sequences_in_flight < lean.sequences_in_flight
+    B = heavy.sequences_in_flight
+    for i, name in enumerate(heavy.order):
+        n = heavy.layers[i][1] - heavy.layers[i][0]
+        extra = (spec.embed_bytes if i == 0 else 0) + (spec.head_bytes if i == len(heavy.order) - 1 else 0)
+        cache = spec.kv_bytes_per_token * 512 + spec.state_bytes_per_seq  # 300 tokens round up to a 512 block
+        assert n * (spec.layer_bytes + B * cache) + extra <= hosts[name].free_mem
 
 
 def test_single_host_degenerate():

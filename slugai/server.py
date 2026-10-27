@@ -34,6 +34,7 @@ from .placement import (
     Placement,
     PlacementError,
     rebalance_with_measurements,
+    same_layout,
     should_rebalance,
     solve,
 )
@@ -210,6 +211,10 @@ class Server:
         self.free_slots: deque[int] = deque()
         self.slot_prompt_ids: dict[int, list[int]] = {}
         self.busy_slots: set[int] = set()
+        # fed prompts whose outputs haven't arrived: the last stage sends them to the
+        # server on its own connection, so they can trail stage 1's slot_free
+        self.awaiting_outputs: set[int] = set()
+        self._fill_tasks: set[asyncio.Task] = set()
         self._all_idle = asyncio.Event()
         self._draining = False
         self._stop = asyncio.Event()
@@ -321,7 +326,13 @@ class Server:
         self._set_phase("place")
         profiles = {n: h.profile for n, h in self.hosts.items()}
         self.placement = solve(
-            self.spec, profiles, self.links, context=self.context, micro_batch=self.micro_batch, num_micro_batches=self.num_micro_batches
+            self.spec,
+            profiles,
+            self.links,
+            context=self.context,
+            micro_batch=self.micro_batch,
+            num_micro_batches=self.num_micro_batches,
+            max_sequences=len(self.prompts),
         )
         self._announce_placement(self.placement)
         self.report["placement"] = self.placement.to_dict()
@@ -381,6 +392,7 @@ class Server:
         await asyncio.gather(*[h.request(pack("start"), "started", timeout=30) for h in self.hosts.values()])
         self.free_slots = deque(range(self.placement.num_micro_batches))
         self.busy_slots.clear()
+        self._last_tokens.clear()  # stages restart their token counters
         self._draining = False
         if self.state.decode_started is None:
             self.state.decode_started = time.monotonic()
@@ -397,7 +409,7 @@ class Server:
             if self._stop.is_set():
                 self.state.log("stopping on request")
                 return
-            if not self.pending and not self.busy_slots:
+            if not self.pending and not self.busy_slots and not self.awaiting_outputs:
                 return
             if self._draining and not self.busy_slots:
                 await self._do_rebalance()
@@ -414,6 +426,7 @@ class Server:
         ids = [self.pending.popleft() for _ in range(min(b, len(self.pending)))]
         self.slot_prompt_ids[slot] = ids
         self.busy_slots.add(slot)
+        self.awaiting_outputs.update(ids)
         first = self.hosts[self.placement.order[0]]
         await first.send(pack("feed", slot=slot, ids=ids, prompts=[self.prompts[i] for i in ids]))
 
@@ -458,7 +471,9 @@ class Server:
             self.slot_prompt_ids.pop(slot, None)
             self.free_slots.append(slot)
             if self.pending and not self._draining and not self._stop.is_set():
-                asyncio.create_task(self._fill_slots())
+                task = asyncio.create_task(self._fill_slots())
+                self._fill_tasks.add(task)
+                task.add_done_callback(self._fill_tasks.discard)
         elif t == "error":
             self.state.log(f"{h.name} error: {f.get('message')}")
             self.state.error = f"{h.name}: {f.get('message')}"
@@ -488,7 +503,7 @@ class Server:
             tg = int(f.get("tokens_generated", 0))
             prev = self._last_tokens.get(h.name)
             self._last_tokens[h.name] = (now, tg)
-            if prev and now > prev[0]:
+            if prev and now > prev[0] and tg >= prev[1]:  # the counter restarts when a stage reloads
                 self.state.tok_s_window.append((tg - prev[1]) / (now - prev[0]))
                 recent = list(self.state.tok_s_window)[-10:]
                 self.state.tok_s = sum(recent) / len(recent)
@@ -498,6 +513,7 @@ class Server:
         ptoks = f.get("prompt_tokens") or [None] * len(ids)
         for i, tk, tx, pt in zip(ids, toks, texts, ptoks):
             self.outputs[int(i)] = {"id": int(i), "prompt": self.prompts[int(i)], "completion": tx, "tokens": len(tk), "prompt_tokens": pt, "token_ids": [int(t) for t in tk]}
+            self.awaiting_outputs.discard(int(i))
             self.state.tokens_generated += len(tk)
         self.state.done_sequences = len(self.outputs)
 
@@ -522,7 +538,11 @@ class Server:
             pass
 
     def maybe_rebalance(self, force: bool = False) -> bool:
-        """Compare live step times to the plan; if a Mac slowed down, drain and re-place."""
+        """Compare live step times to the plan; if a Mac slowed down, drain and re-place.
+
+        ``force`` (the dashboard's [r]) skips the minimum-gain rule but still
+        needs a different, faster layout.
+        """
         if self.placement is None or self._draining:
             return False
         measured = {}
@@ -534,15 +554,18 @@ class Server:
             return False
         profiles = {n: h.profile for n, h in self.hosts.items()}
         try:
-            proposed = rebalance_with_measurements(self.placement, self.spec, profiles, self.links, measured)
+            now, proposed = rebalance_with_measurements(self.placement, self.spec, profiles, self.links, measured)
         except PlacementError as e:
             self.state.log(f"rebalance: {e}")
             return False
-        if force or should_rebalance(self.placement, proposed):
+        better = not same_layout(now, proposed) and proposed.predicted_tok_s > now.predicted_tok_s
+        if should_rebalance(now, proposed) or (force and better):
             self._proposed = proposed
             self._draining = True
             self.state.log(
-                "rebalance planned: " + "  ".join(f"{n}:{a}-{b - 1}" for n, (a, b) in zip(proposed.order, proposed.layers)) + " — draining slots"
+                "rebalance planned: "
+                + "  ".join(f"{n}:{a}-{b - 1}" for n, (a, b) in zip(proposed.order, proposed.layers))
+                + f" ({now.predicted_tok_s:.1f} -> {proposed.predicted_tok_s:.1f} tok/s predicted) — draining slots"
             )
             return True
         return False

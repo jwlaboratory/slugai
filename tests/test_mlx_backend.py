@@ -63,7 +63,8 @@ def test_model_info_and_stage_shapes(tiny_model):
     assert len(s1.inner.layers) == 2 and len(s3.inner.layers) == L - 4
     x = np.array([[1, 5, 6, 7], [1, 5, 0, 0]], dtype=np.int32)  # right padded
     h = s1.run(0, "prefill", x, pad_lens=[0, 2])
-    assert h.shape == (2, 4, 32) and h.dtype == np.float16
+    # hidden states leave a stage in the model's dtype (the tiny Qwen3-Next is float32)
+    assert h.shape == (2, 4, 32) and h.dtype == (np.float32 if tiny_model.name == "next" else np.float16)
     h = s2.run(0, "prefill", h, pad_lens=[0, 2])
     t = s3.run(0, "prefill", h, pad_lens=[0, 2])
     assert t.shape == (2,) and t.dtype == np.int32
@@ -72,6 +73,22 @@ def test_model_info_and_stage_shapes(tiny_model):
     h = s2.run(0, "decode", h)
     t2 = s3.run(0, "decode", h)
     assert t2.shape == (2,)
+
+
+def test_cache_sizes_match_allocation(tiny_model):
+    """The spec's KV + state sizes (placement's memory model) match what a stage really allocates."""
+    from mlx.utils import tree_flatten
+    from slugai.mlx_backend import MLXBackend
+
+    be = MLXBackend(use_chat_template=False)
+    sp = be.model_info(str(tiny_model)).spec
+    assert (sp.state_bytes_per_seq > 0) == (tiny_model.name == "next")  # linear attention keeps state
+    L, b, T = sp.num_layers, 3, 5
+    stage = be.load_stage(str(tiny_model), (0, L), first=True, last=True)
+    stage.run(0, "prefill", np.ones((b, T), dtype=np.int32), pad_lens=[0] * b)
+    got = sum(a.nbytes for c in stage.caches[0] for _, a in tree_flatten(c.state) if isinstance(a, mx.array))
+    want = L * b * sp.cache_bytes_per_seq(T)
+    assert abs(got - want) <= 0.05 * want, (got, want)
 
 
 def test_profile(tiny_model):

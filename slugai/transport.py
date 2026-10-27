@@ -81,9 +81,9 @@ class Connection:
                 continue
             return f
 
-    def start_heartbeat(self, interval: float = HEARTBEAT_INTERVAL) -> None:
+    def start_heartbeat(self, interval: Optional[float] = None) -> None:
         if self._hb_task is None:
-            self._hb_task = asyncio.create_task(self._heartbeat(interval))
+            self._hb_task = asyncio.create_task(self._heartbeat(interval or HEARTBEAT_INTERVAL))
 
     async def _heartbeat(self, interval: float) -> None:
         try:

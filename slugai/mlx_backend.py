@@ -13,7 +13,10 @@ here without per-model code:
 * KV caches come from mlx-lm (``make_prompt_cache`` merged into batch caches),
   which handle padding and per-sequence RoPE offsets — including hybrid
   models such as Qwen3-Next whose linear-attention layers keep state arrays
-  instead of keys and values.
+  instead of keys and values;
+* hidden states cross the wire in the model's own dtype (bfloat16 as its raw
+  16 bits, since numpy has no bfloat16), so the ring computes exactly what one
+  machine would and large activations never overflow float16.
 
 Prompts are **right**-padded for prefill (``padding_side = "right"``), exactly
 as mlx-lm's batch generator does, and the caches are finalised into the
@@ -34,7 +37,7 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import BatchKVCache, make_prompt_cache
 from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
 
 from .backend import Backend, ModelInfo, Stage, Tokenizer
@@ -71,6 +74,44 @@ def _active_memory() -> int:
 
 def _nbytes(module: nn.Module) -> int:
     return sum(a.nbytes for _, a in tree_flatten(module.parameters()))
+
+
+def _compute_dtype(layer: nn.Module):
+    for _, a in tree_flatten(layer.parameters()):
+        if a.dtype in (mx.float16, mx.bfloat16, mx.float32):
+            return a.dtype
+    return mx.float16
+
+
+def _to_wire(h: mx.array) -> np.ndarray:
+    if h.dtype == mx.bfloat16:
+        return np.array(h.view(mx.uint16))
+    return np.array(h)
+
+
+def _from_wire(x: np.ndarray, dtype) -> mx.array:
+    if x.dtype == np.uint16:  # bfloat16 bits
+        return mx.array(x).view(mx.bfloat16).astype(dtype)
+    return mx.array(x).astype(dtype)
+
+
+def _cache_bytes(model, tokens: int) -> int:
+    """Cache bytes for one sequence after ``tokens`` tokens, from a lazy forward pass.
+
+    Nothing is evaluated (or read from disk): array shapes are known as soon as
+    the graph is built.
+    """
+    caches = make_prompt_cache(model)
+    model.model(mx.zeros((1, tokens), dtype=mx.int32), cache=caches)
+    return sum(a.nbytes for c in caches for _, a in tree_flatten(c.state) if isinstance(a, mx.array))
+
+
+def _cache_sizes(model, block: int) -> tuple[int, int]:
+    """(KV bytes per token, fixed state bytes per sequence), each averaged over layers."""
+    n = len(model.model.layers)
+    one, two = _cache_bytes(model, 1), _cache_bytes(model, block + 1)
+    per_token = (two - one) / block
+    return int(per_token / n + 0.5), max(0, int((one - per_token * block) / n + 0.5))
 
 
 class _Identity(nn.Module):
@@ -114,7 +155,7 @@ class MLXStage(Stage):
         import inspect
 
         self.supports_input_embeddings = "input_embeddings" in inspect.signature(self.inner.__call__).parameters
-        self.dtype = self._compute_dtype()
+        self.dtype = _compute_dtype(self.inner.layers[0])
         self.weight_bytes = _nbytes(self.inner.layers[0]) * len(self.inner.layers)
         if first or (last and self.tie):
             self.weight_bytes += _nbytes(self.inner.embed_tokens)
@@ -122,12 +163,6 @@ class MLXStage(Stage):
             self.weight_bytes += _nbytes(self.inner.norm)
             if not self.tie and hasattr(model, "lm_head"):
                 self.weight_bytes += _nbytes(model.lm_head)
-
-    def _compute_dtype(self):
-        for _, a in tree_flatten(self.inner.layers[0].parameters()):
-            if a.dtype in (mx.float16, mx.bfloat16, mx.float32):
-                return a.dtype
-        return mx.float16
 
     # -------------------------------------------------------------- caches
 
@@ -186,7 +221,7 @@ class MLXStage(Stage):
         if self.first:
             inp = mx.array(x.astype(np.int32))
         else:
-            inp = mx.array(x).astype(self.dtype)
+            inp = _from_wire(x, self.dtype)
         h = self._forward(inp, caches)
         if padded:
             for c in caches:
@@ -197,9 +232,9 @@ class MLXStage(Stage):
             mx.eval(tokens, [c.state for c in caches])
             out = np.array(tokens, dtype=np.int32)
         else:
-            out = h.astype(mx.float16)
+            out = h.astype(self.dtype)
             mx.eval(out, [c.state for c in caches])
-            out = np.array(out, dtype=np.float16)
+            out = _to_wire(out)
         return out
 
 
@@ -248,18 +283,22 @@ class MLXBackend(Backend):
         n_heads = int(text_cfg.get("num_attention_heads", 1))
         n_kv = int(text_cfg.get("num_key_value_heads", n_heads))
         head_dim = int(text_cfg.get("head_dim") or hidden // max(n_heads, 1))
-        kv_per_layer = 2 * n_kv * head_dim * 2  # fp16 keys + values
-        # hybrid models: only some layers keep a KV cache
-        attn_fraction = 1.0
-        if "layer_types" in text_cfg:
-            lt = text_cfg["layer_types"]
-            attn_fraction = sum(1 for t in lt if "attention" in str(t) and "linear" not in str(t)) / max(len(lt), 1)
-        elif "full_attention_interval" in text_cfg:
-            attn_fraction = 1.0 / int(text_cfg["full_attention_interval"])
-        kv_bytes = int(kv_per_layer * attn_fraction) + 64  # + a little for state arrays
-        # weight sizes from a lazy model (no bytes are read)
+        # weight and cache sizes from a lazy model (no bytes are read)
         model, _ = load_model(self.model_path(model_id), lazy=True, strict=False)
         inner = model.model
+        dtype = _compute_dtype(inner.layers[0])
+        block = int(getattr(BatchKVCache, "step", 256))
+        try:
+            kv_bytes, state_bytes = _cache_sizes(model, block)
+        except Exception as e:  # unusual forward pass: estimate from the config
+            log.warning("could not measure cache sizes (%s); estimating from config", e)
+            attn_fraction = 1.0  # hybrid models: only some layers keep a KV cache
+            if "layer_types" in text_cfg:
+                lt = text_cfg["layer_types"]
+                attn_fraction = sum(1 for t in lt if "attention" in str(t) and "linear" not in str(t)) / max(len(lt), 1)
+            elif "full_attention_interval" in text_cfg:
+                attn_fraction = 1.0 / int(text_cfg["full_attention_interval"])
+            kv_bytes, state_bytes = int(2 * n_kv * head_dim * dtype.size * attn_fraction), 0
         layer_bytes = int(sum(_nbytes(l) for l in inner.layers) / max(len(inner.layers), 1))
         embed_bytes = _nbytes(inner.embed_tokens)
         head_bytes = _nbytes(inner.norm)
@@ -272,7 +311,17 @@ class MLXBackend(Backend):
         pad = getattr(tok.w, "pad_token_id", None)
         if pad is None:
             pad = eos[0] if eos else 0
-        spec = ModelSpec(num_layers=L, hidden_size=hidden, layer_bytes=layer_bytes, kv_bytes_per_token=kv_bytes, embed_bytes=embed_bytes, head_bytes=head_bytes)
+        spec = ModelSpec(
+            num_layers=L,
+            hidden_size=hidden,
+            layer_bytes=layer_bytes,
+            kv_bytes_per_token=kv_bytes,
+            embed_bytes=embed_bytes,
+            head_bytes=head_bytes,
+            hidden_dtype_bytes=dtype.size,
+            state_bytes_per_seq=state_bytes,
+            kv_block_tokens=block,
+        )
         return ModelInfo(model_id, spec, eos_token_ids=eos, pad_token_id=int(pad), vocab_size=int(text_cfg.get("vocab_size", 0)), extra={"model_type": cfg.get("model_type"), "quantization": cfg.get("quantization")})
 
     # -------------------------------------------------------------- memory

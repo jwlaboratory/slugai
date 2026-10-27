@@ -1,4 +1,4 @@
-"""Command-line entry point: ``slugai`` (alias ``slowring``).
+"""Command-line entry point: ``slugai``.
 
     slugai host                      start on each MacBook; waits for a server
     slugai run --model M --prompts P start a job on the server

@@ -23,7 +23,6 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 slugai = "slugai.cli:main"
-slowring = "slugai.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["slugai*"]

@@ -16,9 +16,10 @@ With ``M`` micro-batches in flight the busiest resource is never idle once
 the ring. Throughput is then ``b * M / max(M * bottleneck, lap)`` tokens/s.
 
 Memory: stage i must hold its weights plus KV cache for every sequence in
-flight: ``L_i * (w + k * B * c) <= m_i`` with ``B = b * M`` sequences and
-context ``c``. Stage 1 also holds the embedding table, the last stage the
-final norm and lm_head.
+flight: ``L_i * (w + B * (k * c + s)) <= m_i`` with ``B = b * M`` sequences,
+context ``c`` (rounded up to the cache's allocation block) and ``s`` bytes of
+fixed per-sequence state (linear-attention layers). Stage 1 also holds the
+embedding table, the last stage the final norm and lm_head.
 """
 
 from __future__ import annotations
@@ -43,10 +44,17 @@ class ModelSpec:
     kv_bytes_per_token: int  # k: KV bytes per layer per token
     embed_bytes: int = 0  # extra on stage 1
     head_bytes: int = 0  # extra on the last stage (norm + lm_head)
-    hidden_dtype_bytes: int = 2  # fp16 on the wire
+    hidden_dtype_bytes: int = 2  # bytes per hidden-state element on the wire
+    state_bytes_per_seq: int = 0  # s: fixed cache bytes per layer per sequence (linear attention)
+    kv_block_tokens: int = 1  # KV caches grow in blocks of this many tokens
 
     def hidden_bytes(self, b: int, tokens: int = 1) -> int:
         return b * tokens * self.hidden_size * self.hidden_dtype_bytes
+
+    def cache_bytes_per_seq(self, context: int) -> int:
+        """Cache bytes one sequence needs per layer at ``context`` tokens."""
+        block = max(1, self.kv_block_tokens)
+        return self.kv_bytes_per_token * (-(-context // block) * block) + self.state_bytes_per_seq
 
 
 @dataclass
@@ -223,7 +231,7 @@ def evaluate(
     """Best placement for a fixed ring order, micro-batch size and count; None if it doesn't fit."""
     S = len(order)
     B = b * M
-    per_layer = spec.layer_bytes + spec.kv_bytes_per_token * B * context
+    per_layer = spec.layer_bytes + B * spec.cache_bytes_per_seq(context)
     extras = _extras_for_order(spec, S)
     caps = []
     for i, name in enumerate(order):
@@ -235,6 +243,21 @@ def evaluate(
         return None
     _, bottleneck = sp
     layers_n = _balanced_split_tiebreak(times, caps, spec.num_layers, bottleneck)
+    return _assemble(spec, links, order, layers_n, times, b, M, context)
+
+
+def _assemble(
+    spec: ModelSpec,
+    links: dict[tuple[str, str], LinkProfile],
+    order: list[str],
+    layers_n: list[int],
+    times: list[float],
+    b: int,
+    M: int,
+    context: int,
+) -> Optional[Placement]:
+    """Predicted timings and throughput for a fixed ring order and layer counts."""
+    S = len(order)
     compute = [l * t for l, t in zip(layers_n, times)]
     hops = []
     for i in range(S):
@@ -270,6 +293,22 @@ def evaluate(
     )
 
 
+def predict(
+    current: Placement,
+    spec: ModelSpec,
+    hosts: dict[str, HostProfile],
+    links: dict[tuple[str, str], LinkProfile],
+) -> Placement:
+    """``current``'s layout (order, layers, micro-batches) re-predicted with other host timings."""
+    b, M = current.micro_batch, current.num_micro_batches
+    times = [hosts[name].time_per_layer(b) for name in current.order]
+    layers_n = [e - a for a, e in current.layers]
+    p = _assemble(spec, links, current.order, layers_n, times, b, M, current.context)
+    if p is None:
+        raise PlacementError("no link profile for the current ring")
+    return p
+
+
 def solve(
     spec: ModelSpec,
     hosts: dict[str, HostProfile],
@@ -279,6 +318,7 @@ def solve(
     num_micro_batches: Optional[int] = None,
     max_micro_batches: int = 8,
     candidates: Iterable[int] = MICRO_BATCH_CANDIDATES,
+    max_sequences: Optional[int] = None,
 ) -> Placement:
     """Choose ring order, layer split, micro-batch size and count.
 
@@ -294,12 +334,17 @@ def solve(
 
     Among everything that satisfies those rules the highest predicted
     throughput wins. ``micro_batch`` / ``num_micro_batches`` pin a choice.
+    ``max_sequences`` (the job size) caps the micro-batch so a small job is
+    still spread over ``S`` micro-batches instead of filling one.
     """
     names = list(hosts)
     S = len(names)
     if S == 0:
         raise PlacementError("no hosts")
     bs = [micro_batch] if micro_batch else [c for c in candidates]
+    if not micro_batch and max_sequences:
+        cap = max(1, -(-max_sequences // S))
+        bs = sorted({c for c in bs if c <= cap} | {min(cap, max(bs))}, reverse=True)
     best: Optional[Placement] = None
     for order in itertools.permutations(names):
         order = list(order)
@@ -347,12 +392,20 @@ def solve(
 
 
 def should_rebalance(current: Placement, proposed: Placement, min_gain: float = 0.10) -> bool:
-    """Move layers only when the new placement is clearly better."""
+    """Move layers only when the new placement is clearly better.
+
+    Both placements must be predicted from the same timings: pass the current
+    layout as re-predicted by :func:`rebalance_with_measurements`, not the
+    original plan.
+    """
     if proposed.predicted_tok_s <= 0:
         return False
     gain = proposed.predicted_tok_s / max(current.predicted_tok_s, 1e-9) - 1.0
-    same = proposed.order == current.order and proposed.layers == current.layers
-    return (not same) and gain >= min_gain
+    return not same_layout(current, proposed) and gain >= min_gain
+
+
+def same_layout(a: Placement, b: Placement) -> bool:
+    return a.order == b.order and [tuple(x) for x in a.layers] == [tuple(x) for x in b.layers]
 
 
 def rebalance_with_measurements(
@@ -361,19 +414,26 @@ def rebalance_with_measurements(
     hosts: dict[str, HostProfile],
     links: dict[tuple[str, str], LinkProfile],
     measured_step: dict[str, float],
-) -> Placement:
+) -> tuple[Placement, Placement]:
     """Fold live per-stage step times back into the host profiles and re-solve.
 
     ``measured_step[host]`` is the observed seconds per micro-batch on that host.
-    We scale that host's profiled time-per-layer by observed/predicted so a Mac
-    that is throttling gets fewer layers next time.
+    We scale that host's profiled time-per-layer by observed / what the profile
+    predicts for its current layers, so a Mac that is throttling gets fewer
+    layers. ``hosts`` are always the original profiles, so the scale stays
+    right after earlier rebalances.
+
+    Returns ``(now, proposed)``: the current layout re-predicted with the
+    measured speeds, and the best layout for them; compare the two with
+    :func:`should_rebalance`.
     """
+    b = current.micro_batch
     hosts2 = {}
     for name, h in hosts.items():
         scale = 1.0
         if name in measured_step and name in current.order:
-            i = current.order.index(name)
-            predicted = current.stage_compute[i]
+            a, e = current.layers[current.order.index(name)]
+            predicted = (e - a) * h.time_per_layer(b)
             if predicted > 0 and measured_step[name] > 0:
                 scale = measured_step[name] / predicted
         hosts2[name] = HostProfile(
@@ -383,7 +443,8 @@ def rebalance_with_measurements(
             prefill_layer_time_per_token=h.prefill_layer_time_per_token,
             extra=h.extra,
         )
-    return solve(
+    now = predict(current, spec, hosts2, links)
+    proposed = solve(
         spec,
         hosts2,
         links,
@@ -391,3 +452,4 @@ def rebalance_with_measurements(
         micro_batch=current.micro_batch,
         num_micro_batches=current.num_micro_batches,
     )
+    return now, proposed
