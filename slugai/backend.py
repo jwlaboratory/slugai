@@ -29,6 +29,8 @@ here without per-model code:
 * a stage may *stream* some of its layers, FlexGen-style: their weights stay
   on disk and are read just before each use, then dropped, so a Mac can run
   more layers than fit in its memory (at the cost of reading them every step).
+  Each streamed layer's weights are read while the one before it computes, so
+  disk reads overlap compute.
 
 Prompts are right-padded for prefill, exactly as mlx-lm's batch generator
 does, and ``pad_lens[i]`` says how many pad tokens sequence ``i`` has; the
@@ -160,9 +162,16 @@ def _weight_files(path: Path) -> dict[str, Path]:
     return {k: f for f in sorted(path.glob("model*.safetensors")) for k in mx.load(str(f))}  # lazy: headers only
 
 
-def _stream(model, layer, index: int, files: dict[str, Path]) -> None:
-    """Make ``layer`` (global number ``index``) read its weights from disk for each call and drop them after."""
+def _stream(model, layer, index: int, files: dict[str, Path]) -> dict:
+    """Make ``layer`` (global number ``index``) read its weights from disk for each call and drop them after.
+
+    Returns the layer's prefetch state: set ``state["next"]`` to the next
+    streamed layer's state, and while this layer computes, that layer's
+    weights are read ahead (after the stage's last streamed layer, the
+    first's, for the next micro-batch), so disk reads overlap compute.
+    """
     prefix = f"model.layers.{index}."
+    state: dict = {"ready": None, "next": None}  # weights being read ahead; the next streamed layer's state
     owning = sorted({f for k, f in files.items() if k.startswith(prefix)})
 
     def load() -> dict:  # the layer's weights as unread arrays: mx.load only parses headers
@@ -177,16 +186,26 @@ def _stream(model, layer, index: int, files: dict[str, Path]) -> None:
         raise ValueError(f"can't stream layer {index}: its weights on disk don't match the model ({sorted(set(want) ^ set(have))[:3]})")
     base = type(layer)
 
+    def prefetch() -> None:
+        state["ready"] = load()
+        mx.async_eval(state["ready"])
+
     def __call__(self, *args, **kwargs):
-        self.update(load())
+        w, state["ready"] = state["ready"] if state["ready"] is not None else load(), None
+        self.update(w)
         out = base.__call__(self, *args, **kwargs)
         cache = kwargs.get("cache", args[2] if len(args) > 2 else None)
-        mx.eval(out, cache.state if cache is not None else [])  # finish with the weights...
+        todo = [out, cache.state if cache is not None else []]
+        mx.async_eval(todo)  # queue this layer first...
+        state["next"]["prefetch"]()  # ...then read the next streamed layer while it computes
+        mx.eval(todo)  # finish with the weights...
         self.update(load())  # ...then swap in unread ones, freeing these
         return out
 
     layer.__class__ = type(f"Streamed{base.__name__}", (base,), {"__call__": __call__})
     layer.update(load())
+    state["prefetch"], state["next"] = prefetch, state
+    return state
 
 
 def _disk_read_speed(files: list[Path], nbytes: int = 1 << 30) -> float:
@@ -445,8 +464,10 @@ class Backend:
         keep = b - a if resident is None else max(0, min(resident, b - a))
         if keep < b - a:
             files = _weight_files(path)
-            for j in range(keep, b - a):
-                _stream(model, inner.layers[j], a + j, files)
+            streams = [_stream(model, inner.layers[j], a + j, files) for j in range(keep, b - a)]
+            for s, nxt in zip(streams, streams[1:] + streams[:1]):
+                s["next"] = nxt
+            streams[0]["prefetch"]()  # the first micro-batch's first streamed layer
         tie = bool(getattr(model.args, "tie_word_embeddings", False))
         to_eval = [l.parameters() for l in inner.layers[:keep]]
         if first or (last and tie):

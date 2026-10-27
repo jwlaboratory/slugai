@@ -1,0 +1,186 @@
+{
+  "job": "job-20261026-204320",
+  "model": "mlx-community/Qwen3-8B-4bit",
+  "version": "0.1.0",
+  "rebalances": [
+    {
+      "at": 209.95880370901432,
+      "from": {
+        "order": [
+          "MacBook-Pro-9",
+          "Mohammads-MacBook-Air-3"
+        ],
+        "layers": [
+          [
+            0,
+            29
+          ],
+          [
+            29,
+            36
+          ]
+        ],
+        "micro_batch": 64,
+        "num_micro_batches": 3,
+        "step_time": 0.49019787866200204,
+        "predicted_tok_s": 391.67856157204335,
+        "peak_tok_s": 391.67856157204335,
+        "stage_compute": [
+          0.163399292887334,
+          0.15945608043705306
+        ],
+        "link_times": [
+          0.029253729386255145,
+          0.004226040588479196
+        ],
+        "context": 279
+      },
+      "to": {
+        "order": [
+          "MacBook-Pro-9",
+          "Mohammads-MacBook-Air-3"
+        ],
+        "layers": [
+          [
+            0,
+            30
+          ],
+          [
+            30,
+            36
+          ]
+        ],
+        "micro_batch": 64,
+        "num_micro_batches": 3,
+        "step_time": 0.5520239067617162,
+        "predicted_tok_s": 347.8110234868464,
+        "peak_tok_s": 347.81102348684647,
+        "stage_compute": [
+          0.18400796892057206,
+          0.17673173064271655
+        ],
+        "link_times": [
+          0.029253729386255145,
+          0.004226040588479196
+        ],
+        "context": 279
+      }
+    }
+  ],
+  "profiles": {
+    "MacBook-Pro-9": {
+      "name": "MacBook-Pro-9",
+      "free_mem": 17344656368,
+      "layer_time": {
+        "1": 0.0005187813112570439,
+        "8": 0.0020201927509333473,
+        "32": 0.003447450500971172,
+        "64": 0.005634458375425311
+      }
+    },
+    "Mohammads-MacBook-Air-3": {
+      "name": "Mohammads-MacBook-Air-3",
+      "free_mem": 10988106736,
+      "layer_time": {
+        "1": 0.001226065062496673,
+        "8": 0.017496362000088084,
+        "32": 0.013063325500070277,
+        "64": 0.02277944006243615
+      }
+    }
+  },
+  "links": [
+    {
+      "src": "MacBook-Pro-9",
+      "dst": "Mohammads-MacBook-Air-3",
+      "used": 1766804.9720521523,
+      "capacity": 21309217.939337116,
+      "carries": "hidden states"
+    },
+    {
+      "src": "Mohammads-MacBook-Air-3",
+      "dst": "MacBook-Pro-9",
+      "used": 1178.7807860983132,
+      "capacity": 24287069.260037545,
+      "carries": "token ids"
+    }
+  ],
+  "model_spec": {
+    "num_layers": 36,
+    "hidden_size": 4096,
+    "layer_bytes": 108544512,
+    "kv_bytes_per_token": 4096,
+    "embed_bytes": 350060544,
+    "head_bytes": 350068736,
+    "hidden_dtype_bytes": 2,
+    "state_bytes_per_seq": 0,
+    "kv_block_tokens": 256
+  },
+  "placement": {
+    "order": [
+      "MacBook-Pro-9",
+      "Mohammads-MacBook-Air-3"
+    ],
+    "layers": [
+      [
+        0,
+        29
+      ],
+      [
+        29,
+        36
+      ]
+    ],
+    "micro_batch": 64,
+    "num_micro_batches": 3,
+    "step_time": 0.49019787866200204,
+    "predicted_tok_s": 391.67856157204335,
+    "peak_tok_s": 391.67856157204335,
+    "stage_compute": [
+      0.163399292887334,
+      0.15945608043705306
+    ],
+    "link_times": [
+      0.029253729386255145,
+      0.004226040588479196
+    ],
+    "context": 279
+  },
+  "sequences": 300,
+  "sequences_done": 300,
+  "partial": false,
+  "tokens_generated": 76800,
+  "elapsed_seconds": 333.9168132090126,
+  "decode_seconds": 308.7361377920024,
+  "tok_s": 248.7561078831033,
+  "tok_h": 895521.9883791719,
+  "output": "ring.jsonl",
+  "hosts": {
+    "MacBook-Pro-9": {
+      "stage": 0,
+      "layers": [
+        0,
+        30
+      ],
+      "busy": 0.9756656751735135,
+      "step": 0.2710182431037538,
+      "mem_used": 6374649680,
+      "mem_total": 19069665280,
+      "bytes_out": 0,
+      "queue": 0
+    },
+    "Mohammads-MacBook-Air-3": {
+      "stage": 1,
+      "layers": [
+        30,
+        36
+      ],
+      "busy": 0.35019716679998963,
+      "step": 0.1029991667058793,
+      "mem_used": 2425489320,
+      "mem_total": 12713115648,
+      "bytes_out": 0,
+      "queue": 0
+    }
+  }
+}
