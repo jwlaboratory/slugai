@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slugai"
+version = "0.1.0"
+description = "Slow distributed inference: throughput-first pipeline-parallel LLM decoding across MacBooks over Wi-Fi"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "zeroconf>=0.130",
+    "textual>=0.80",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.32.3", "mlx-lm>=0.32"]  # earlier versions break batched caches
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+slugai = "slugai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["slugai*"]
+
+[tool.setuptools.package-data]
+slugai = ["data/*.jsonl"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
