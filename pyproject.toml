@@ -1,0 +1,19 @@
+[project]
+name = "slugai"
+version = "0.1.0"
+description = "Slow distributed inference: throughput-first LLM decoding across a ring of Macs"
+requires-python = ">=3.12"
+dependencies = [
+    "mlx>=0.32.3",  # older versions break mlx-lm's batch caches
+    "mlx-lm>=0.32",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false  # nothing to install: run from the repo root, e.g. `uv run python -m host.model`
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["host/tests"]

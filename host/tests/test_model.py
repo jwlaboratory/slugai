@@ -12,14 +12,14 @@ def num_layers(model: str) -> int:
     return len(load_model(model_path(model), lazy=True)[0].model.layers)
 
 
-def generate(shards: list[Shard], steps: int = 4) -> list[mx.array]:
-    """Each step's logits for PROMPTS as one right-padded micro-batch, decoded greedily."""
-    caches = [s.new_cache(len(PROMPTS)) for s in shards]
-    lengths = [len(p) - 1 for p in PROMPTS]
-    x = mx.array([p[:-1] + [0] * (max(lengths) - n) for p, n in zip(PROMPTS, lengths)])
+def generate(shards: list[Shard], prompts: list[list[int]] = PROMPTS, steps: int = 4) -> list[mx.array]:
+    """Each step's logits for ``prompts`` as one right-padded micro-batch, decoded greedily."""
+    caches = [s.new_cache(len(prompts)) for s in shards]
+    lengths = [len(p) - 1 for p in prompts]
+    x = mx.array([p[:-1] + [0] * (max(lengths) - n) for p, n in zip(prompts, lengths)])
     for s, c in zip(shards, caches):
         x = s.forward(x, c, lengths)
-    x, logits = mx.array([[p[-1]] for p in PROMPTS]), []
+    x, logits = mx.array([[p[-1]] for p in prompts]), []
     for _ in range(steps):
         for s, c in zip(shards, caches):
             x = s.forward(x, c)

@@ -45,19 +45,19 @@ QWEN3_NEXT = {
     "norm_topk_prob": True,
 }
 
-MODELS = {
-    "qwen3": (qwen3, QWEN3),
-    "qwen3-4bit": (qwen3, {**QWEN3, "quantization": {"group_size": 32, "bits": 4}}),
-    "qwen3-tied": (qwen3, {**QWEN3, "tie_word_embeddings": True}),
-    "qwen3-next": (qwen3_next, QWEN3_NEXT),
+MODELS = {  # name -> (architecture, config, weights' dtype)
+    "qwen3": (qwen3, QWEN3, mx.float16),
+    "qwen3-bf16": (qwen3, QWEN3, mx.bfloat16),
+    "qwen3-4bit": (qwen3, {**QWEN3, "quantization": {"group_size": 32, "bits": 4}}, mx.float16),
+    "qwen3-tied": (qwen3, {**QWEN3, "tie_word_embeddings": True}, mx.float16),
+    "qwen3-next": (qwen3_next, QWEN3_NEXT, mx.float32),  # MoE on the CPU build needs float32
 }
 
 
-def build(path: Path, arch, config: dict) -> Path:
+def build(path: Path, arch, config: dict, dtype) -> Path:
     mx.random.seed(0)
     model = arch.Model(arch.ModelArgs.from_dict(config))
-    # small random weights, so greedy decoding isn't degenerate; float32 for MoE, which the CPU build needs
-    dtype = mx.float32 if arch is qwen3_next else mx.float16
+    # small random weights, so greedy decoding isn't degenerate
     model.update(tree_map(lambda v: (mx.random.normal(v.shape) / v.shape[-1] ** 0.5 if v.ndim > 1 else mx.ones(v.shape)).astype(dtype), model.parameters()))
     if "quantization" in config:
         nn.quantize(model, **config["quantization"])
